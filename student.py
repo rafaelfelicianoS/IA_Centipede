@@ -30,22 +30,24 @@ except ImportError:
     ANALYSIS_AVAILABLE = False
     logging.warning("Analysis modules not available, using basic strategies")
 
-# Configure logging
-# Ensure log file is always created next to this file (not depending on cwd)
+# Configure logging: place log next to this file and use UTF-8
 LOG_DIR = os.path.dirname(__file__)
 LOG_PATH = os.path.join(LOG_DIR, 'agent_debug.log')
 file_handler = logging.FileHandler(LOG_PATH, encoding='utf-8')
 stream_handler = logging.StreamHandler()
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed to DEBUG for more detailed logs
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[file_handler, stream_handler]
 )
 logger = logging.getLogger('CentipedeAgent')
 
-pygame.init()
-program_icon = pygame.image.load("data/icon2.png")
-pygame.display.set_icon(program_icon)
+try:
+    pygame.init()
+    program_icon = pygame.image.load("data/icon2.png")
+    pygame.display.set_icon(program_icon)
+except Exception:
+    logger.debug("pygame init or icon load failed; continuing without icon")
 
 
 @dataclass
@@ -152,13 +154,29 @@ class GameState:
         self.consecutive_misses = 0
         self.chase_cooldowns: Dict[str, int] = {}  # centipede_name -> step to resume
         
+        # Player stuck detection
+        self.last_positions: deque = deque(maxlen=10)  # Track last 10 positions
+        self.stuck_counter = 0  # How many frames player hasn't moved
+        self.last_action_attempted = ""  # Last movement command tried
+        
     def update(self, state: dict):
         """Update game state from server message"""
+        prev_pos = self.bug_blaster_pos
+        
         if 'bug_blaster' in state:
             pos = state['bug_blaster']['pos']
             new_pos = Position(pos[0], pos[1])
             self.bug_blaster_pos = new_pos
             self.position_history.append(new_pos.to_tuple())
+            
+            # Track stuck detection
+            self.last_positions.append(new_pos.to_tuple())
+            
+            # Check if player is stuck (position hasn't changed)
+            if prev_pos and prev_pos == new_pos:
+                self.stuck_counter += 1
+            else:
+                self.stuck_counter = 0
         
         if 'centipedes' in state:
             self.centipedes = [
@@ -286,6 +304,23 @@ class GameState:
                     logger.warning(f"Centipede {centipede.name} appears stuck!")
         
         return stuck_centipedes
+    
+    def is_player_stuck(self, threshold: int = 5) -> bool:
+        """
+        Detect if player is stuck (trying to move but position not changing)
+        Returns True if player hasn't moved for 'threshold' consecutive frames
+        """
+        if self.stuck_counter >= threshold:
+            return True
+        
+        # Alternative: check if last N positions are all the same
+        if len(self.last_positions) >= threshold:
+            unique_positions = set(list(self.last_positions)[-threshold:])
+            if len(unique_positions) <= 1:  # All same position
+                return True
+        
+        return False
+        
 
 
 class PathFinder:
@@ -610,6 +645,17 @@ class StrategyManager:
         # Update strategy based on game state
         self._update_strategy()
         
+        # PRIORITY -1: Unstuck maneuver
+        # If player is stuck AND there are stuck centipedes, try alternative movement
+        if self.game_state.is_player_stuck(threshold=5):
+            stuck_centipedes = self.game_state.detect_stuck_centipedes()
+            if stuck_centipedes:
+                logger.warning(f"PLAYER AND CENTIPEDES STUCK! Player stuck for {self.game_state.stuck_counter} frames")
+                unstuck_action = self._unstuck_maneuver(current_pos)
+                if unstuck_action:
+                    logger.info(f"Unstuck maneuver: {unstuck_action}")
+                    return unstuck_action
+        
         # PRIORITY 0: Immediate shot if perfectly aligned (before emergency check)
         # This ensures we never miss a perfect shot even when in slight danger
         # BUT we need to avoid futile horizontal chases
@@ -669,6 +715,32 @@ class StrategyManager:
             logger.debug(f"Shooting: {reason}")
             return "A"
         
+        # PRIORITY 2.5: Return to safe zone if we're too far up
+        # This is CRITICAL: we can only score points when below centipedes!
+        # If we're above safe_zone_y and there's no immediate danger, move down
+        if current_pos.y < self.game_state.safe_zone_y:
+            # Check if there are centipedes nearby that we need to avoid
+            min_centipede_dist = float('inf')
+            if self.game_state.centipedes:
+                for centipede in self.game_state.centipedes:
+                    dist = current_pos.distance_to(centipede.head)
+                    min_centipede_dist = min(min_centipede_dist, dist)
+            
+            # Only return to safe zone if centipedes are far enough (not immediate threat)
+            if min_centipede_dist > 5:  # Safe distance
+                # Check if moving down is safe
+                down_pos = Position(current_pos.x, current_pos.y + 1)
+                if self.game_state.is_safe_position(down_pos):
+                    logger.info(f"RETURNING TO SAFE ZONE: Currently at y={current_pos.y}, moving down to y={down_pos.y}")
+                    return 's'
+                # If can't move straight down, try diagonal down
+                else:
+                    for dx in [-1, 1]:  # Try left-down or right-down
+                        diag_pos = Position(current_pos.x + dx, current_pos.y + 1)
+                        if self.game_state.is_safe_position(diag_pos):
+                            logger.debug(f"Returning to safe zone diagonally: {'a' if dx < 0 else 'd'} then s")
+                            return 'a' if dx < 0 else 'd'
+        
         # Execute current strategy
         if self.current_strategy == "AGGRESSIVE":
             action = self._aggressive_strategy()
@@ -700,14 +772,15 @@ class StrategyManager:
         # Count centipedes
         centipede_count = len(self.game_state.centipedes)
         
-        # Check if centipedes are nearby
+        # Check if centipedes are nearby - AUMENTADO O RANGE para 15
         centipedes_nearby = False
         if self.game_state.centipedes:
             nearest = self.game_state.get_nearest_centipede_head()
             if nearest:
                 dist = self.game_state.bug_blaster_pos.distance_to(nearest.head)
-                if dist < 10:
+                if dist < 15:  # AUMENTADO de 10 para 15
                     centipedes_nearby = True
+                    logger.debug(f"Centipede nearby at distance {dist}")
         
         # Count mushrooms in movement area
         mushroom_count = sum(
@@ -715,18 +788,19 @@ class StrategyManager:
             if m.y >= self.game_state.safe_zone_y
         )
         
-        # Decide strategy
-        if threat_count > 10:
-            if self.current_strategy != "DEFENSIVE":
-                logger.info("Switching to DEFENSIVE strategy")
-            self.current_strategy = "DEFENSIVE"
-            self.strategy_timer = 0
-        
-        elif centipedes_nearby and centipede_count > 0:
-            # If centipedes are nearby, be aggressive!
+        # Decide strategy - PRIORIDADE MUDADA!
+        # ALTA PRIORIDADE: Se há centopeia, seja agressivo!
+        if centipedes_nearby and centipede_count > 0:
+            # If centipedes are nearby, be aggressive! (MOVED TO TOP PRIORITY)
             if self.current_strategy != "AGGRESSIVE":
                 logger.info("Switching to AGGRESSIVE strategy - centipedes nearby!")
             self.current_strategy = "AGGRESSIVE"
+            self.strategy_timer = 0
+        
+        elif threat_count > 10:
+            if self.current_strategy != "DEFENSIVE":
+                logger.info("Switching to DEFENSIVE strategy")
+            self.current_strategy = "DEFENSIVE"
             self.strategy_timer = 0
         
         elif mushroom_count > 20 and threat_count < 5 and not centipedes_nearby:
@@ -735,8 +809,8 @@ class StrategyManager:
             self.current_strategy = "CLEARING"
             self.strategy_timer = 0
         
-        elif self.game_state.step < 300 and not centipedes_nearby:
-            # Early game: position well only if no centipedes nearby
+        elif self.game_state.step < 300 and not centipedes_nearby and centipede_count == 0:
+            # Early game: position well ONLY if NO centipedes exist at all
             if self.current_strategy != "POSITIONING":
                 logger.info("Switching to POSITIONING strategy")
             self.current_strategy = "POSITIONING"
@@ -902,13 +976,22 @@ class StrategyManager:
         
         ideal_pos = Position(ideal_x, ideal_y)
         
-        if current_pos.distance_to(ideal_pos) > 2:
+        # CORREÇÃO: Verificar se já está perto o suficiente
+        distance = current_pos.distance_to(ideal_pos)
+        if distance > 2:
             move = self._get_move_towards(current_pos, ideal_pos)
             if move:
-                logger.debug("Positioning for optimal play")
+                logger.debug(f"Positioning for optimal play (distance={distance})")
                 return move
+            else:
+                # Se não consegue se mover em direção à posição ideal,
+                # mude para patrulha inteligente
+                logger.debug("Can't reach ideal position, switching to smart patrol")
+                return self._smart_patrol()
         
-        return None
+        # Se já está na posição ideal, patrulhe
+        logger.debug("Already at ideal position, patrolling")
+        return self._smart_patrol()
     
     def _default_strategy(self) -> Optional[str]:
         """Default balanced strategy"""
@@ -917,14 +1000,46 @@ class StrategyManager:
     def _can_safely_shoot_vertical(self, pos: Position) -> Tuple[bool, Optional[Tuple[int, int]]]:
         """
         Check if we can safely shoot at a centipede directly above us.
-        Based on game mechanics: shooting a centipede directly above is always safe
-        because it spawns a mushroom and the centipede turns away, so if we don't move,
-        we won't be hit.
+        IMPORTANT: This is only safe if there are NO centipedes approaching horizontally!
         
         Returns: (can_shoot, target_position)
         """
         if not self.game_state.centipedes:
             return (False, None)
+        
+        # CRITICAL FIX: Check for horizontal threats FIRST
+        # If we're going to shoot and stay still, we need to make sure no centipede 
+        # can hit us horizontally while we're shooting
+        for centipede in self.game_state.centipedes:
+            for seg_x, seg_y in centipede.body:
+                # Check if centipede is on our row or 1 row above/below
+                if abs(seg_y - pos.y) <= 1:
+                    # Check if it's close horizontally (within 3 tiles)
+                    if abs(seg_x - pos.x) <= 3:
+                        # Too dangerous - centipede could hit us while we're shooting!
+                        logger.debug(f"UNSAFE vertical shot: centipede at ({seg_x},{seg_y}) too close horizontally")
+                        return (False, None)
+        
+        # Now check for vertical shot opportunities
+        for centipede in self.game_state.centipedes:
+            for seg_x, seg_y in centipede.body:
+                # Is it directly above us?
+                if seg_x == pos.x and seg_y < pos.y:
+                    # Check if path is clear (no mushrooms blocking)
+                    clear = True
+                    for y in range(seg_y + 1, pos.y):
+                        if Position(pos.x, y) in self.game_state.mushrooms:
+                            clear = False
+                            break
+                    
+                    if clear:
+                        # This is a safe shot!
+                        # When we hit: mushroom spawns, centipede turns/splits
+                        # If we don't move after shooting, we're safe (assuming no horizontal threats)
+                        logger.info(f"SAFE VERTICAL SHOT available at ({seg_x},{seg_y}), distance={pos.y - seg_y}")
+                        return (True, (seg_x, seg_y))
+        
+        return (False, None)
         
         # Check each centipede for segments directly above us
         for centipede in self.game_state.centipedes:
@@ -1013,12 +1128,35 @@ class StrategyManager:
                     return move
         
         # Fallback: try all directions and pick the safest
-        moves = [
-            ('w', Position(current.x, current.y - 1)),
-            ('s', Position(current.x, current.y + 1)),
-            ('a', Position(current.x - 1, current.y)),
-            ('d', Position(current.x + 1, current.y))
-        ]
+        # IMPORTANT: Prefer movement towards safe zone when possible
+        current_y = current.y
+        safe_zone_y = self.game_state.safe_zone_y
+        
+        # Prioritize moves that keep us in or return us to safe zone
+        if current_y < safe_zone_y:
+            # We're above safe zone - prefer moving DOWN
+            moves = [
+                ('s', Position(current.x, current.y + 1)),  # Down - FIRST
+                ('a', Position(current.x - 1, current.y)),
+                ('d', Position(current.x + 1, current.y)),
+                ('w', Position(current.x, current.y - 1)),  # Up - LAST
+            ]
+        elif current_y >= self.game_state.map_height - 2:
+            # We're at bottom edge - prefer moving UP or horizontal
+            moves = [
+                ('w', Position(current.x, current.y - 1)),  # Up - FIRST
+                ('a', Position(current.x - 1, current.y)),
+                ('d', Position(current.x + 1, current.y)),
+                ('s', Position(current.x, current.y + 1)),  # Down - LAST
+            ]
+        else:
+            # We're in safe zone - prefer horizontal movement
+            moves = [
+                ('a', Position(current.x - 1, current.y)),
+                ('d', Position(current.x + 1, current.y)),
+                ('s', Position(current.x, current.y + 1)),
+                ('w', Position(current.x, current.y - 1)),
+            ]
         
         # Sort by safety (distance from danger)
         safe_moves = []
@@ -1041,6 +1179,62 @@ class StrategyManager:
                     return cmd
         
         return None
+    
+    def _unstuck_maneuver(self, current: Position) -> Optional[str]:
+        """
+        Special maneuver when player is stuck (can't reach target due to obstacles)
+        Strategy: Try vertical movement first, then horizontal, to navigate around obstacles
+        """
+        # First, try to find if there's a mushroom blocking immediate path
+        blocking_mushroom = None
+        
+        # Check all 4 directions for mushrooms
+        adjacent_mushrooms = []
+        for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:  # Up, Down, Left, Right
+            check_pos = Position(current.x + dx, current.y + dy)
+            if check_pos in self.game_state.mushrooms:
+                adjacent_mushrooms.append((check_pos, dx, dy))
+        
+        # If there's a mushroom blocking, try to shoot it if we can
+        for mushroom_pos, dx, dy in adjacent_mushrooms:
+            # If mushroom is above us and path is clear
+            if dy < 0 and mushroom_pos.x == current.x:
+                logger.debug(f"Unstuck: Shooting blocking mushroom at {mushroom_pos.to_tuple()}")
+                return "A"
+        
+        # Try vertical movement to get around obstacles
+        # Prioritize moving UP first (towards action), then DOWN
+        moves_priority = [
+            ('w', Position(current.x, current.y - 1)),  # Up
+            ('s', Position(current.x, current.y + 1)),  # Down
+            ('a', Position(current.x - 1, current.y)),  # Left
+            ('d', Position(current.x + 1, current.y)),  # Right
+        ]
+        
+        # Try each move in priority order
+        for cmd, pos in moves_priority:
+            # Check if position is valid and safe
+            if (0 <= pos.x < self.game_state.map_width and 
+                0 <= pos.y < self.game_state.map_height):
+                
+                # Must be free of mushrooms
+                if pos not in self.game_state.mushrooms:
+                    # Prefer positions that aren't in immediate danger
+                    if pos not in self.game_state.danger_zones:
+                        logger.debug(f"Unstuck: Moving {cmd} to {pos.to_tuple()}")
+                        return cmd
+        
+        # If all safe moves are blocked, try any move that's at least valid
+        for cmd, pos in moves_priority:
+            if (0 <= pos.x < self.game_state.map_width and 
+                0 <= pos.y < self.game_state.map_height):
+                if pos not in self.game_state.mushrooms:
+                    logger.warning(f"Unstuck (desperate): Moving {cmd} to {pos.to_tuple()}")
+                    return cmd
+        
+        # Completely stuck - try shooting to clear path
+        logger.warning("Completely stuck! Shooting to clear path")
+        return "A"
     
     def _get_move_towards(self, current: Position, target: Position) -> Optional[str]:
         """Get single move command towards target"""
@@ -1066,15 +1260,58 @@ class StrategyManager:
         
         # Prioritize larger movement
         if abs(dx) > abs(dy):
+            # Try horizontal movement first
             if dx > 0:
                 new_pos = Position(current.x + 1, current.y)
                 if self.game_state.is_safe_position(new_pos):
                     return 'd'
+                # Horizontal blocked, try vertical as alternative
+                else:
+                    if dy > 0:
+                        alt_pos = Position(current.x, current.y + 1)
+                        if self.game_state.is_safe_position(alt_pos):
+                            logger.debug("Horizontal blocked, moving down instead")
+                            return 's'
+                    elif dy < 0:
+                        alt_pos = Position(current.x, current.y - 1)
+                        if self.game_state.is_safe_position(alt_pos):
+                            logger.debug("Horizontal blocked, moving up instead")
+                            return 'w'
+                    # Try any vertical movement
+                    for vert_cmd, vert_pos in [
+                        ('w', Position(current.x, current.y - 1)),
+                        ('s', Position(current.x, current.y + 1))
+                    ]:
+                        if self.game_state.is_safe_position(vert_pos):
+                            logger.debug(f"Horizontal blocked, trying vertical: {vert_cmd}")
+                            return vert_cmd
+                            
             elif dx < 0:
                 new_pos = Position(current.x - 1, current.y)
                 if self.game_state.is_safe_position(new_pos):
                     return 'a'
+                # Horizontal blocked, try vertical as alternative
+                else:
+                    if dy > 0:
+                        alt_pos = Position(current.x, current.y + 1)
+                        if self.game_state.is_safe_position(alt_pos):
+                            logger.debug("Horizontal blocked, moving down instead")
+                            return 's'
+                    elif dy < 0:
+                        alt_pos = Position(current.x, current.y - 1)
+                        if self.game_state.is_safe_position(alt_pos):
+                            logger.debug("Horizontal blocked, moving up instead")
+                            return 'w'
+                    # Try any vertical movement
+                    for vert_cmd, vert_pos in [
+                        ('w', Position(current.x, current.y - 1)),
+                        ('s', Position(current.x, current.y + 1))
+                    ]:
+                        if self.game_state.is_safe_position(vert_pos):
+                            logger.debug(f"Horizontal blocked, trying vertical: {vert_cmd}")
+                            return vert_cmd
         
+        # Try vertical movement
         if dy > 0:
             new_pos = Position(current.x, current.y + 1)
             if self.game_state.is_safe_position(new_pos):
@@ -1148,6 +1385,13 @@ class StrategyManager:
                     else:
                         return 'd'
         
+        # IMPORTANT: If we're above safe zone and no immediate threat, move down
+        if current.y < self.game_state.safe_zone_y:
+            down_pos = Position(current.x, current.y + 1)
+            if self.game_state.is_safe_position(down_pos):
+                logger.debug(f"Stay mobile: returning to safe zone from y={current.y}")
+                return 's'
+        
         # Prefer horizontal movement in safe zone, avoiding edges
         if current.x < 3:
             return 'd'
@@ -1192,11 +1436,19 @@ class StrategyManager:
                     return 'a'
                 elif nearest.head.x > current.x + 1:
                     return 'd'
-                # If we're roughly aligned, move up a bit if safe
+                # If we're roughly aligned but ABOVE safe zone, DON'T move up more!
+                # Only move up if we're IN the safe zone and want to get closer
                 elif current.y > self.game_state.safe_zone_y:
                     target = Position(current.x, current.y - 1)
                     if self.game_state.is_safe_position(target):
                         return 'w'
+        
+        # IMPORTANT: If we're above safe zone, return to it
+        if current.y < self.game_state.safe_zone_y:
+            down_pos = Position(current.x, current.y + 1)
+            if self.game_state.is_safe_position(down_pos):
+                logger.debug(f"Smart patrol: returning to safe zone from y={current.y}")
+                return 's'
         
         # Default patrol behavior - avoid edges
         if current.x <= 2:
