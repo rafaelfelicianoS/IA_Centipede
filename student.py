@@ -1,904 +1,1128 @@
 """
-IA Clássica para Centipede - Projeto Académico
-Estratégia: Máquina de Estados Finitos (FSM) com Heurísticas Híbridas
-
-PROIBIDO: Reinforcement Learning, Machine Learning, Redes Neuronais, Q-Learning, etc.
-PERMITIDO: Apenas IA clássica/algoritmos determinísticos/heurísticas fixas
-
-Autor: Student Agent
-Data: 2025
+Autonomous Agent for Centipede Game
+Authors: AI Centipede Team
+Strategy: Multi-layered intelligent agent with prediction, pathfinding, and adaptive tactics
 """
 
 import asyncio
+import getpass
 import json
 import os
-import getpass
-import websockets
-from enum import Enum
-from typing import Optional
 import math
-from datetime import datetime
-import time
-from collections import deque
+from collections import deque, defaultdict
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Set, Dict
+import logging
+
+import pygame
+import websockets
+
+# Import our advanced analysis modules
+try:
+    from agent_analysis import (
+        CentipedePredictor,
+        MushroomAnalyzer,
+        ThreatAnalyzer,
+        ThreatAssessment
+    )
+    ANALYSIS_AVAILABLE = True
+except ImportError:
+    ANALYSIS_AVAILABLE = False
+    logging.warning("Analysis modules not available, using basic strategies")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,  # Changed to DEBUG for more detailed logs
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('agent_debug.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('CentipedeAgent')
+
+pygame.init()
+program_icon = pygame.image.load("data/icon2.png")
+pygame.display.set_icon(program_icon)
 
 
-# ============================================================================
-# CONSTANTES (ajustáveis para afinar comportamento)
-# ============================================================================
-
-# Thresholds de perigo
-DANGER_DISTANCE_LINES = 3  # Se centipede está a menos de 3 linhas, EVADE
-SAFE_DISTANCE_LINES = 4    # Após esta distância, voltar a ATTACK (sair mais cedo de EVADE)
-
-# Preferências de posicionamento
-PREFERRED_CENTER_X = 20    # Coluna central ideal
-IDEAL_MIN_Y = 18           # Linha mínima ideal (zona de manobra)
-
-# Pesos para scoring de alvos (priorizar segmentos mais altos = mais pontos)
-TARGET_HEIGHT_WEIGHT = 2.0
-TARGET_PROXIMITY_WEIGHT = 1.0
-
-# Cooldown interno (frames esperados após disparar)
-INTERNAL_COOLDOWN = 10
-
-# Mapa
-MAP_WIDTH = 40
-MAP_HEIGHT = 24
-
-
-# ============================================================================
-# ENUMS
-# ============================================================================
-
-class AgentMode(Enum):
-    """Estados da Máquina de Estados Finitos"""
-    ATTACK = "ATTACK"          # Perseguir e disparar em centipedes
-    EVADE = "EVADE"            # Fugir de centipedes próximas
-    REPOSITION = "REPOSITION"  # Ajustar posição tática
-
-
-# ============================================================================
-# CLASSE PRINCIPAL DO AGENTE
-# ============================================================================
-
-class CentipedeAgent:
-    """
-    Agente baseado em FSM (Finite State Machine) para jogar Centipede.
+@dataclass
+class Position:
+    """Represents a position on the game map"""
+    x: int
+    y: int
     
-    Estratégia:
-    1. ATTACK: Procura cabeças de centipedes, alinha-se e dispara (maximizar score)
-    2. EVADE: Foge quando centipedes estão perigosamente perto (sobrevivência)
-    3. REPOSITION: Ajusta posição para melhor campo de tiro
-    """
+    def __hash__(self):
+        return hash((self.x, self.y))
+    
+    def __eq__(self, other):
+        return self.x == other.x and self.y == other.y
+    
+    def distance_to(self, other: 'Position') -> float:
+        """Calculate Manhattan distance to another position"""
+        return abs(self.x - other.x) + abs(self.y - other.y)
+    
+    def euclidean_distance_to(self, other: 'Position') -> float:
+        """Calculate Euclidean distance to another position"""
+        return math.sqrt((self.x - other.x)**2 + (self.y - other.y)**2)
+    
+    def to_tuple(self) -> Tuple[int, int]:
+        return (self.x, self.y)
+
+
+@dataclass
+class Centipede:
+    """Represents a centipede in the game"""
+    name: str
+    body: List[Tuple[int, int]]
+    direction: int  # 0=NORTH, 1=EAST, 2=SOUTH, 3=WEST
+    
+    @property
+    def head(self) -> Position:
+        """Get the head position"""
+        if self.body:
+            return Position(self.body[0][0], self.body[0][1])
+        return Position(0, 0)
+    
+    @property
+    def length(self) -> int:
+        return len(self.body)
+    
+    def predict_next_positions(self, num_steps: int = 5) -> List[Position]:
+        """Predict where the centipede head will be in the next steps"""
+        # Simplified prediction - assumes horizontal movement
+        predictions = []
+        current = self.head
+        
+        # Determine horizontal direction
+        if self.direction == 1:  # EAST
+            for i in range(1, num_steps + 1):
+                predictions.append(Position(current.x + i, current.y))
+        elif self.direction == 3:  # WEST
+            for i in range(1, num_steps + 1):
+                predictions.append(Position(current.x - i, current.y))
+        
+        return predictions
+
+
+class GameState:
+    """Manages the current state of the game"""
     
     def __init__(self):
-        # Estado interno
-        self.player_pos: Optional[tuple[int, int]] = None
-        self.centipedes: list[dict] = []
-        self.mushrooms: set[tuple[int, int]] = set()
-        self.blasts: list[tuple[int, int]] = []
-        self.score: int = 0
-        self.step: int = 0
+        self.map_width = 40
+        self.map_height = 24
+        self.bug_blaster_pos: Optional[Position] = None
+        self.centipedes: List[Centipede] = []
+        self.mushrooms: Set[Position] = set()
+        self.blasts: Set[Position] = set()
+        self.score = 0
+        self.step = 0
+        self.safe_zone_y = 19  # Bottom 5 rows (24-5=19)
         
-        # Controle de disparo (cooldown interno)
-        self.frames_since_last_shot: int = INTERNAL_COOLDOWN
-        self.can_shoot: bool = True
+        # Threat tracking
+        self.danger_zones: Set[Position] = set()
+        self.last_action = ""
+        self.cooldown = 0
         
-        # FSM
-        self.current_mode: AgentMode = AgentMode.ATTACK
-        self.last_action: Optional[str] = None
-
-        # Logging estruturado (JSON Lines)
-        self.logging_enabled: bool = True
-        base_dir = os.path.dirname(__file__)
-        self._log_dir = os.path.join(base_dir, "logs")
-        os.makedirs(self._log_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        user = getpass.getuser() or "user"
-        self._log_path = os.path.join(self._log_dir, f"agent_{timestamp}_{user}.jsonl")
-        self._session_id = f"{timestamp}-{os.getpid()}"
-        self._last_reason: str = ""
-        self._last_context: dict = {}
-        self._last_transition_reason: Optional[str] = None
-
-        # Históricos para detetar padrões indesejados (ex.: oscilação esquerda/direita)
-        self._action_history: deque[str] = deque(maxlen=6)
-        self._pos_history: deque[tuple[int, int]] = deque(maxlen=6)
+        # History tracking for pattern detection
+        self.centipede_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=20))
+        self.position_history: deque = deque(maxlen=50)
+        self.score_history: deque = deque(maxlen=100)
         
-    def update(self, state: dict) -> None:
-        """
-        Atualiza representação interna a partir do estado recebido do servidor.
-        """
-        # Jogador
-        bug_blaster = state.get("bug_blaster", {})
-        self.player_pos = tuple(bug_blaster.get("pos", (20, 23)))
-        
-        # Centipedes (apenas vivas)
-        self.centipedes = state.get("centipedes", [])
-        
-        # Mushrooms (converter para set de posições para lookup O(1))
-        self.mushrooms = {tuple(m["pos"]) for m in state.get("mushrooms", [])}
-        
-        # Blasts
-        self.blasts = [tuple(b) for b in state.get("blasts", [])]
-        
-        # Metadata
-        self.score = state.get("score", 0)
-        self.step = state.get("step", 0)
-        
-        # Atualizar cooldown
-        self.frames_since_last_shot += 1
-        self.can_shoot = self.frames_since_last_shot >= INTERNAL_COOLDOWN
-    
-    # ------------------------------------------------------------------------
-    # SELEÇÃO DE MODO (FSM TRANSITIONS)
-    # ------------------------------------------------------------------------
-    
-    def select_mode(self) -> AgentMode:
-        """
-        Determina o modo atual da FSM com base no estado do jogo.
-        
-        Lógica de transição:
-        - EVADE: Se há perigo iminente (centipede muito perto)
-        - REPOSITION: Se não há alvos acessíveis ou posição é ruim
-        - ATTACK: Caso contrário (condição default)
-        """
-        min_danger = self._calculate_min_danger_distance()
-        
-        # TRANSIÇÃO: QUALQUER → EVADE (prioridade máxima)
-        if min_danger < DANGER_DISTANCE_LINES:
-            next_mode = AgentMode.EVADE
-            if next_mode != self.current_mode:
-                self._last_transition_reason = "danger_below_threshold"
-                self._log(
-                    kind="mode_transition",
-                    payload={
-                        "from": self.current_mode.value,
-                        "to": next_mode.value,
-                        "danger": min_danger,
-                        "reason": self._last_transition_reason,
-                    },
-                )
-            return next_mode
-        
-        # TRANSIÇÃO: EVADE → REPOSITION/ATTACK
-        if self.current_mode == AgentMode.EVADE and min_danger > SAFE_DISTANCE_LINES:
-            # Sair de EVADE apenas se longe o suficiente
-            next_mode = AgentMode.ATTACK if self._is_in_good_position() else AgentMode.REPOSITION
-            if next_mode != self.current_mode:
-                self._last_transition_reason = "safe_distance_reached"
-                self._log(
-                    kind="mode_transition",
-                    payload={
-                        "from": self.current_mode.value,
-                        "to": next_mode.value,
-                        "danger": min_danger,
-                        "reason": self._last_transition_reason,
-                    },
-                )
-            return next_mode
-        
-        # TRANSIÇÃO: REPOSITION → ATTACK
-        if self.current_mode == AgentMode.REPOSITION and (self._is_in_good_position() or self._has_accessible_targets()):
-            next_mode = AgentMode.ATTACK
-            if next_mode != self.current_mode:
-                self._last_transition_reason = "good_position_achieved"
-                self._log(
-                    kind="mode_transition",
-                    payload={
-                        "from": self.current_mode.value,
-                        "to": next_mode.value,
-                        "reason": self._last_transition_reason,
-                    },
-                )
-            return next_mode
-        
-        # TRANSIÇÃO: ATTACK → REPOSITION
-        if self.current_mode == AgentMode.ATTACK and not self._has_accessible_targets():
-            next_mode = AgentMode.REPOSITION
-            if next_mode != self.current_mode:
-                self._last_transition_reason = "no_accessible_targets"
-                self._log(
-                    kind="mode_transition",
-                    payload={
-                        "from": self.current_mode.value,
-                        "to": next_mode.value,
-                        "reason": self._last_transition_reason,
-                    },
-                )
-            return next_mode
-        
-        # Manter modo atual se nenhuma transição foi acionada
-        return self.current_mode
-    
-    # ------------------------------------------------------------------------
-    # DECISÃO DE AÇÃO (dentro de cada modo)
-    # ------------------------------------------------------------------------
-    
-    def decide_action(self) -> Optional[str]:
-        """
-        Escolhe ação concreta (w/a/s/d/A) com base no modo atual.
-        
-        Retorna:
-            str: "w", "a", "s", "d", "A", ou None (sem ação)
-        """
-        t0 = time.perf_counter()
-        # Atualizar modo
-        self.current_mode = self.select_mode()
-        self._last_reason = ""
-        self._last_context = {}
-        action: Optional[str] = None
-        
-        # Decidir ação baseada no modo
-        if self.current_mode == AgentMode.ATTACK:
-            action = self._attack_logic()
-        elif self.current_mode == AgentMode.EVADE:
-            action = self._evade_logic()
-        elif self.current_mode == AgentMode.REPOSITION:
-            action = self._reposition_logic()
-        
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        # Métricas para contexto da decisão
-        danger = self._calculate_min_danger_distance()
-        best_target = self._get_best_target()
-        clear_shot = bool(best_target and self._has_clear_shot(best_target[0]))
-        payload = {
-            "action": action or "",
-            "mode": self.current_mode.value,
-            "reason": self._last_reason,
-            "context": self._last_context,
-            "step": self.step,
-            "score": self.score,
-            "player_pos": list(self.player_pos) if self.player_pos else None,
-            "danger": danger,
-            "best_target": list(best_target) if best_target else None,
-            "clear_shot": clear_shot,
-            "can_shoot": self.can_shoot,
-            "frames_since_last_shot": self.frames_since_last_shot,
-            "centipedes": len(self.centipedes),
-            "decision_ms": dt_ms,
-        }
-        # Detetar oscilação e tentar quebrar com movimento vertical
-        if action in ("a", "d") and self._is_oscillating():
-            px, py = self.player_pos if self.player_pos else (None, None)
-            break_action = None
-            if px is not None:
-                if self._is_safe_move(px, py + 1):
-                    break_action = "s"
-                    self._last_reason = "break_oscillation_down"
-                    self._last_context = {"from_y": py, "to_y": py + 1}
-                elif self._is_safe_move(px, py - 1):
-                    break_action = "w"
-                    self._last_reason = "break_oscillation_up"
-                    self._last_context = {"from_y": py, "to_y": py - 1}
-            if break_action:
-                action = break_action
-                payload["action"] = action
-                payload["reason"] = self._last_reason
-                payload["context"] = self._last_context
-
-        # Atualizar históricos
-        if self.player_pos:
-            self._pos_history.append(self.player_pos)
-        if action:
-            self._action_history.append(action)
-
-        self._log(kind="decision", payload=payload)
-        return action
-    
-    # ------------------------------------------------------------------------
-    # LÓGICA POR MODO
-    # ------------------------------------------------------------------------
-    
-    def _attack_logic(self) -> Optional[str]:
-        """
-        Modo ATTACK: Procura melhor alvo, alinha-se e dispara.
-        
-        Estratégia:
-        1. Identificar alvo prioritário (cabeça mais alta + mais próxima)
-        2. Mover horizontalmente até alinhar com alvo
-        3. Disparar quando alinhado e com cooldown pronto
-        4. Subir ligeiramente para melhor campo de tiro (mas sem entrar na zona de perigo)
-        """
-        target = self._get_best_target()
-        
-        if target is None:
-            # Sem alvos → trocar para REPOSITION
-            self._last_reason = "no_target"
-            self._last_context = {}
-            return None
-        
-        target_x, target_y = target
-        player_x, player_y = self.player_pos
-        
-        # 1. DISPARAR se alinhado e cooldown OK
-        if self.can_shoot and player_x == target_x:
-            clear = self._has_clear_shot(target_x)
-            has_msh = bool(self._find_mushroom_in_column(player_x))
-            has_cent = self._has_centipede_in_column(player_x)
-            if clear or has_msh or has_cent:
-                self.frames_since_last_shot = 0
-                self.can_shoot = False
-                self._last_reason = "aligned_shot"
-                self._last_context = {
-                    "target": [target_x, target_y],
-                    "clear": clear,
-                    "mushroom_in_front": has_msh,
-                    "centipede_in_column": has_cent,
-                }
-                return "A"
-        
-        # 2. Manter-se na zona inferior ideal para poder disparar na cobra
-        if player_y < IDEAL_MIN_Y:
-            if self._is_safe_move(player_x, player_y + 1):
-                self._last_reason = "return_to_bottom"
-                self._last_context = {"from_y": player_y, "to_y": player_y + 1}
-                return "s"
-
-        # 3. ALINHAR HORIZONTALMENTE com alvo
-        if player_x < target_x:
-            # Verificar se pode mover para direita
-            if self._is_safe_move(player_x + 1, player_y):
-                self._last_reason = "move_right_to_align"
-                self._last_context = {"from_x": player_x, "to_x": player_x + 1, "target_x": target_x}
-                return "d"
-        elif player_x > target_x:
-            # Verificar se pode mover para esquerda
-            if self._is_safe_move(player_x - 1, player_y):
-                self._last_reason = "move_left_to_align"
-                self._last_context = {"from_x": player_x, "to_x": player_x - 1, "target_x": target_x}
-                return "a"
+        # Analysis systems (if available)
+        if ANALYSIS_AVAILABLE:
+            self.predictor = CentipedePredictor(self.map_width, self.map_height)
+            self.mushroom_analyzer = MushroomAnalyzer(self.map_width, self.map_height)
+            self.threat_analyzer = ThreatAnalyzer(self.map_width, self.map_height)
         else:
-            # Já alinhado em X: se não puder disparar agora, tentar descer para manter pressão
-            if not self.can_shoot and self._is_safe_move(player_x, player_y + 1):
-                self._last_reason = "aligned_descend_waiting_cooldown"
-                self._last_context = {"from_y": player_y, "to_y": player_y + 1}
-                return "s"
+            self.predictor = None
+            self.mushroom_analyzer = None
+            self.threat_analyzer = None
         
-        # 4. SUBIR ligeiramente se muito abaixo (para melhor ângulo)
-        if player_y > IDEAL_MIN_Y and player_y > target_y + 5:
-            if self._is_safe_move(player_x, player_y - 1):
-                self._last_reason = "move_up_for_angle"
-                self._last_context = {"from_y": player_y, "to_y": player_y - 1, "target_y": target_y}
-                return "w"
+        # Performance metrics
+        self.hits_made = 0
+        self.shots_fired = 0
+        self.mushrooms_destroyed = 0
         
-        # 5. Se já alinhado mas em cooldown, esperar pelo disparo
-        if player_x == target_x and not self.can_shoot:
-            self._last_reason = "aligned_wait_cooldown"
-            self._last_context = {"frames_since_last_shot": self.frames_since_last_shot}
+    def update(self, state: dict):
+        """Update game state from server message"""
+        if 'bug_blaster' in state:
+            pos = state['bug_blaster']['pos']
+            new_pos = Position(pos[0], pos[1])
+            self.bug_blaster_pos = new_pos
+            self.position_history.append(new_pos.to_tuple())
         
-        # 6. Fallback: tentar mover aleatoriamente mas com segurança
-        action = self._random_safe_move(prefer_vertical=True)
-        if action:
-            self._last_reason = "random_safe_move"
-            self._last_context = {"action": action}
-        else:
-            self._last_reason = "no_action_possible"
-            self._last_context = {}
-        return action
-    
-    def _evade_logic(self) -> Optional[str]:
-        """
-        Modo EVADE: Foge de centipedes próximas.
+        if 'centipedes' in state:
+            self.centipedes = [
+                Centipede(
+                    name=c['name'],
+                    body=c['body'],
+                    direction=c['direction']
+                )
+                for c in state['centipedes']
+            ]
+            
+            # Track centipede movements
+            for centipede in self.centipedes:
+                self.centipede_history[centipede.name].append(centipede.head.to_tuple())
         
-        Estratégia:
-        1. Calcular coluna mais longe de todas as centipedes
-        2. Mover horizontalmente para essa coluna
-        3. NÃO disparar (prioridade = sobrevivência)
-        4. Se encurralado por mushrooms, tentar destruir um
-        """
-        safe_column = self._find_safest_column()
-        player_x, player_y = self.player_pos
-        
-        # Mover para coluna segura
-        if player_x < safe_column:
-            if self._is_safe_move(player_x + 1, player_y):
-                self._last_reason = "move_right_to_safe_column"
-                self._last_context = {"from_x": player_x, "to_x": player_x + 1, "safe_column": safe_column}
-                return "d"
-            else:
-                # Bloqueado por mushroom, tentar destruir
-                if self.can_shoot:
-                    self.frames_since_last_shot = 0
-                    self._last_reason = "blocked_by_mushroom_shoot"
-                    self._last_context = {"dir": "right"}
-                    return "A"
-        elif player_x > safe_column:
-            if self._is_safe_move(player_x - 1, player_y):
-                self._last_reason = "move_left_to_safe_column"
-                self._last_context = {"from_x": player_x, "to_x": player_x - 1, "safe_column": safe_column}
-                return "a"
-            else:
-                # Bloqueado por mushroom, tentar destruir
-                if self.can_shoot:
-                    self.frames_since_last_shot = 0
-                    self._last_reason = "blocked_by_mushroom_shoot"
-                    self._last_context = {"dir": "left"}
-                    return "A"
-        
-        # Se já na coluna segura, descer para ter mais espaço de manobra
-        if player_y < MAP_HEIGHT - 2:
-            if self._is_safe_move(player_x, player_y + 1):
-                self._last_reason = "descend_for_space"
-                self._last_context = {"from_y": player_y, "to_y": player_y + 1}
-                return "s"
-        
-        self._last_reason = "no_evade_action"
-        self._last_context = {}
-        return None
-    
-    def _reposition_logic(self) -> Optional[str]:
-        """
-        Modo REPOSITION: Ajusta posição para melhor tática.
-        
-        Estratégia:
-        1. Mover para coluna central (x=20) se não estiver lá
-        2. Manter linha ideal (y=18-20)
-        3. Limpar mushrooms no caminho
-        """
-        player_x, player_y = self.player_pos
-        
-        # 1. Ajustar X para centro
-        if abs(player_x - PREFERRED_CENTER_X) > 2:
-            if player_x < PREFERRED_CENTER_X:
-                if self._is_safe_move(player_x + 1, player_y):
-                    self._last_reason = "center_right"
-                    self._last_context = {"from_x": player_x, "to_x": player_x + 1}
-                    return "d"
-            else:
-                if self._is_safe_move(player_x - 1, player_y):
-                    self._last_reason = "center_left"
-                    self._last_context = {"from_x": player_x, "to_x": player_x - 1}
-                    return "a"
-        
-        # 2. Ajustar Y para zona ideal
-        if player_y < IDEAL_MIN_Y:
-            if self._is_safe_move(player_x, player_y + 1):
-                self._last_reason = "adjust_y_down"
-                self._last_context = {"from_y": player_y, "to_y": player_y + 1}
-                return "s"
-        elif player_y > IDEAL_MIN_Y + 2:
-            if self._is_safe_move(player_x, player_y - 1):
-                self._last_reason = "adjust_y_up"
-                self._last_context = {"from_y": player_y, "to_y": player_y - 1}
-                return "w"
-        
-        # 3. Limpar mushroom à frente se houver
-        if self.can_shoot:
-            mushroom_ahead = self._find_mushroom_in_column(player_x)
-            if mushroom_ahead:
-                self.frames_since_last_shot = 0
-                self._last_reason = "clear_mushroom_ahead"
-                self._last_context = {"mushroom": list(mushroom_ahead)}
-                return "A"
-        
-        self._last_reason = "hold_position"
-        self._last_context = {}
-        return None
-
-    # ------------------------------------------------------------------------
-    # LOGGING
-    # ------------------------------------------------------------------------
-    def _log(self, kind: str, payload: dict) -> None:
-        if not self.logging_enabled:
-            return
-        try:
-            record = {
-                "ts": datetime.utcnow().isoformat() + "Z",
-                "session": self._session_id,
-                "kind": kind,
+        if 'mushrooms' in state:
+            old_mushroom_count = len(self.mushrooms)
+            self.mushrooms = {
+                Position(m['pos'][0], m['pos'][1])
+                for m in state['mushrooms']
             }
-            # Garantir serialização segura
-            if isinstance(payload, dict):
-                record.update(payload)
-            else:
-                record["payload"] = payload
-            with open(self._log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except Exception:
-            # Não interromper o jogo por causa de logging
-            pass
+            # Track mushrooms destroyed
+            if old_mushroom_count > len(self.mushrooms):
+                self.mushrooms_destroyed += old_mushroom_count - len(self.mushrooms)
+        
+        if 'blasts' in state:
+            self.blasts = {
+                Position(b[0], b[1])
+                for b in state['blasts']
+            }
+        
+        prev_score = self.score
+        self.score = state.get('score', 0)
+        self.step = state.get('step', 0)
+        self.score_history.append(self.score)
+        
+        # Track hits
+        if self.score > prev_score:
+            score_gain = self.score - prev_score
+            if score_gain >= 100:  # Hit a centipede
+                self.hits_made += 1
+                logger.info(f"HIT! Score +{score_gain}. Total hits: {self.hits_made}")
+        
+        # Update danger zones
+        self._update_danger_zones()
     
-    # ------------------------------------------------------------------------
-    # FUNÇÕES UTILITÁRIAS (HEURÍSTICAS)
-    # ------------------------------------------------------------------------
-    
-    def _calculate_min_danger_distance(self) -> float:
-        """
-        Calcula distância (em linhas) até a centipede mais próxima.
+    def _update_danger_zones(self):
+        """Calculate positions that are dangerous"""
+        self.danger_zones.clear()
         
-        Retorna:
-            float: Distância mínima ou infinito se não há centipedes
-        """
-        if not self.player_pos or not self.centipedes:
-            return float('inf')
-        
-        player_x, player_y = self.player_pos
-        min_dist = float('inf')
-        
+        # Mark all centipede body positions as dangerous
         for centipede in self.centipedes:
-            body = centipede.get("body", [])
-            for seg_x, seg_y in body:
-                # Distância vertical (mais importante que horizontal)
-                vertical_dist = abs(player_y - seg_y)
-                horizontal_dist = abs(player_x - seg_x)
-                
-                # Combinação: priorizar distância vertical
-                combined_dist = vertical_dist + horizontal_dist * 0.3
-                min_dist = min(min_dist, combined_dist)
-        
-        return min_dist
+            for seg in centipede.body:
+                self.danger_zones.add(Position(seg[0], seg[1]))
+                # Mark positions around centipede segments
+                for dx in [-1, 0, 1]:
+                    for dy in [-1, 0, 1]:
+                        nx, ny = seg[0] + dx, seg[1] + dy
+                        if 0 <= nx < self.map_width and 0 <= ny < self.map_height:
+                            self.danger_zones.add(Position(nx, ny))
     
-    def _get_best_target(self) -> Optional[tuple[int, int]]:
-        """
-        Seleciona alvo prioritário: cabeça de centipede mais alta e mais próxima.
-        
-        Estratégia de scoring:
-        - Prioridade 1: Altura (Y menor = mais pontos no jogo)
-        - Prioridade 2: Proximidade horizontal ao jogador
-        
-        Retorna:
-            tuple[int, int]: (x, y) do melhor alvo ou None
-        """
-        if not self.centipedes or not self.player_pos:
-            return None
-        
-        player_x, player_y = self.player_pos
-        best_target = None
-        best_score = -float('inf')
-        
-        for centipede in self.centipedes:
-            body = centipede.get("body", [])
-            if not body:
-                continue
-            
-            # Cabeça é o último elemento do body
-            head_x, head_y = body[-1]
-            
-            # Score: quanto menor Y (mais alto), melhor
-            # Score: quanto mais perto horizontalmente, melhor
-            height_score = -head_y * TARGET_HEIGHT_WEIGHT
-            proximity_score = -abs(player_x - head_x) * TARGET_PROXIMITY_WEIGHT
-            
-            total_score = height_score + proximity_score
-            
-            if total_score > best_score:
-                best_score = total_score
-                best_target = (head_x, head_y)
-        
-        return best_target
-    
-    def _has_clear_shot(self, column: int) -> bool:
-        """
-        Verifica se há caminho livre (sem mushrooms) entre jogador e topo da coluna.
-        
-        Args:
-            column: Coluna X a verificar
-            
-        Retorna:
-            bool: True se pode disparar livremente
-        """
-        if not self.player_pos:
+    def is_safe_position(self, pos: Position, extra_danger: Optional[Set[Position]] = None) -> bool:
+        """Check if a position is safe to move to"""
+        # Check boundaries
+        if not (0 <= pos.x < self.map_width and 0 <= pos.y < self.map_height):
             return False
         
-        player_x, player_y = self.player_pos
+        # Check if position has mushroom
+        if pos in self.mushrooms:
+            return False
         
-        # Verificar se há mushrooms entre jogador e linha 0
-        for y in range(0, player_y):
-            if (column, y) in self.mushrooms:
-                return False
+        # Check if position is in danger zone
+        if pos in self.danger_zones:
+            return False
+        
+        # Check extra dangers if provided
+        if extra_danger and pos in extra_danger:
+            return False
         
         return True
+    
+    def get_nearest_centipede_head(self) -> Optional[Centipede]:
+        """Get the centipede head nearest to bug blaster"""
+        if not self.centipedes or not self.bug_blaster_pos:
+            return None
+        
+        nearest = min(
+            self.centipedes,
+            key=lambda c: self.bug_blaster_pos.distance_to(c.head)
+        )
+        return nearest
+    
+    def count_mushrooms_in_column(self, x: int) -> int:
+        """Count mushrooms in a specific column"""
+        return sum(1 for m in self.mushrooms if m.x == x)
+    
+    def get_performance_stats(self) -> Dict:
+        """Get performance statistics"""
+        accuracy = (self.hits_made / self.shots_fired * 100) if self.shots_fired > 0 else 0
+        return {
+            'hits_made': self.hits_made,
+            'shots_fired': self.shots_fired,
+            'accuracy': accuracy,
+            'mushrooms_destroyed': self.mushrooms_destroyed,
+            'score_per_step': self.score / max(self.step, 1)
+        }
+    
+    def detect_stuck_centipedes(self) -> List[str]:
+        """Detect centipedes that appear to be stuck"""
+        stuck_centipedes = []
+        
+        if self.predictor:
+            for centipede in self.centipedes:
+                history = list(self.centipede_history[centipede.name])
+                if self.predictor.detect_stuck_centipede(
+                    centipede.body,
+                    history,
+                    threshold=10
+                ):
+                    stuck_centipedes.append(centipede.name)
+                    logger.warning(f"Centipede {centipede.name} appears stuck!")
+        
+        return stuck_centipedes
 
-    def _has_centipede_in_column(self, column: int) -> bool:
+
+class PathFinder:
+    """A* pathfinding for safe navigation"""
+    
+    def __init__(self, game_state: GameState):
+        self.game_state = game_state
+    
+    def find_path(self, start: Position, goal: Position) -> Optional[List[Position]]:
+        """Find safe path from start to goal using A*"""
+        if not self.game_state.is_safe_position(goal):
+            return None
+        
+        frontier = [(0, start)]
+        came_from = {start: None}
+        cost_so_far = {start: 0}
+        
+        while frontier:
+            frontier.sort(key=lambda x: x[0])
+            _, current = frontier.pop(0)
+            
+            if current == goal:
+                break
+            
+            for next_pos in self._get_neighbors(current):
+                new_cost = cost_so_far[current] + 1
+                
+                if next_pos not in cost_so_far or new_cost < cost_so_far[next_pos]:
+                    cost_so_far[next_pos] = new_cost
+                    priority = new_cost + goal.distance_to(next_pos)
+                    frontier.append((priority, next_pos))
+                    came_from[next_pos] = current
+        
+        if goal not in came_from:
+            return None
+        
+        # Reconstruct path
+        path = []
+        current = goal
+        while current != start:
+            path.append(current)
+            current = came_from[current]
+        path.reverse()
+        
+        return path
+    
+    def _get_neighbors(self, pos: Position) -> List[Position]:
+        """Get valid neighboring positions"""
+        neighbors = []
+        for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:  # Up, Down, Left, Right
+            next_pos = Position(pos.x + dx, pos.y + dy)
+            if self.game_state.is_safe_position(next_pos):
+                neighbors.append(next_pos)
+        return neighbors
+
+
+class TargetingSystem:
+    """Intelligent targeting system for shooting centipedes"""
+    
+    def __init__(self, game_state: GameState):
+        self.game_state = game_state
+        self.last_shot_step = 0
+    
+    def should_shoot(self) -> Tuple[bool, str]:
         """
-        Verifica se existe alguma centipede na coluna acima do jogador.
+        Determine if we should shoot now
+        Returns (should_shoot, reason)
         """
-        if not self.player_pos:
-            return False
-        _, player_y = self.player_pos
-        for centipede in self.centipedes:
-            body = centipede.get("body", [])
-            for seg_x, seg_y in body:
-                if seg_x == column and seg_y < player_y:
+        if not self.game_state.bug_blaster_pos:
+            return (False, "No blaster position")
+        
+        blaster_x = self.game_state.bug_blaster_pos.x
+        blaster_y = self.game_state.bug_blaster_pos.y
+        
+        # Check cooldown - reduced to 1 for more aggressive shooting
+        if self.game_state.step - self.last_shot_step < 1:
+            return (False, "Cooldown")
+        
+        best_shot_value = 0
+        best_shot_target = None
+        
+        # Check each centipede segment
+        for centipede in self.game_state.centipedes:
+            for i, (seg_x, seg_y) in enumerate(centipede.body):
+                if seg_x == blaster_x and seg_y < blaster_y:
+                    # Check if path is clear (no mushrooms in the way)
+                    clear_path = True
+                    for y in range(seg_y + 1, blaster_y):
+                        if Position(blaster_x, y) in self.game_state.mushrooms:
+                            clear_path = False
+                            break
+                    
+                    if clear_path:
+                        # Calculate shot value
+                        # Higher value for: closer, head shots, higher on screen
+                        distance = blaster_y - seg_y
+                        is_head = (i == 0 or i == len(centipede.body) - 1)
+                        height_bonus = (self.game_state.map_height - seg_y) * 2
+                        
+                        shot_value = 100 - distance + height_bonus
+                        if is_head:
+                            shot_value += 50
+                        
+                        if shot_value > best_shot_value:
+                            best_shot_value = shot_value
+                            best_shot_target = (seg_x, seg_y)
+        
+        if best_shot_value > 20:  # Lower threshold for more aggressive shooting
+            self.last_shot_step = self.game_state.step
+            self.game_state.shots_fired += 1
+            return (True, f"Good shot at {best_shot_target}, value={best_shot_value}")
+        
+        # Use predictor if available
+        if self.game_state.predictor and self.game_state.centipedes:
+            for centipede in self.game_state.centipedes:
+                mushroom_positions = {(m.x, m.y) for m in self.game_state.mushrooms}
+                predictions = self.game_state.predictor.predict_trajectory(
+                    centipede.body,
+                    centipede.direction,
+                    mushroom_positions,
+                    num_steps=5
+                )
+                
+                # Check if centipede will pass through our column
+                for step_num, future_body in enumerate(predictions):
+                    for seg_x, seg_y in future_body:
+                        if seg_x == blaster_x and seg_y < blaster_y:
+                            # Predictive shot
+                            if step_num <= 2:  # Close prediction
+                                self.last_shot_step = self.game_state.step
+                                self.game_state.shots_fired += 1
+                                return (True, f"Predictive shot, step={step_num}")
+        
+        return (False, "No good shot")
+    
+    def get_best_shooting_position(self) -> Optional[Position]:
+        """Find the best position to shoot from"""
+        if not self.game_state.centipedes:
+            return None
+        
+        # Use advanced analysis if available
+        if self.game_state.predictor:
+            mushroom_positions = {(m.x, m.y) for m in self.game_state.mushrooms}
+            all_predictions = []
+            
+            for centipede in self.game_state.centipedes:
+                predictions = self.game_state.predictor.predict_trajectory(
+                    centipede.body,
+                    centipede.direction,
+                    mushroom_positions,
+                    num_steps=10
+                )
+                all_predictions.append(predictions)
+            
+            # Find shooting lanes
+            lanes = self.game_state.predictor.find_safe_shooting_lanes(
+                (self.game_state.bug_blaster_pos.x, self.game_state.bug_blaster_pos.y),
+                all_predictions,
+                mushroom_positions
+            )
+            
+            if lanes:
+                best_lane = lanes[0]
+                logger.debug(f"Best shooting lane: x={best_lane[0]}, probability={best_lane[2]:.2f}")
+                return Position(best_lane[0], self.game_state.bug_blaster_pos.y)
+        
+        # Fallback: aim at nearest centipede
+        nearest = self.game_state.get_nearest_centipede_head()
+        if nearest:
+            return Position(nearest.head.x, self.game_state.bug_blaster_pos.y)
+        
+        return None
+    
+    def find_mushroom_to_clear(self) -> Optional[Position]:
+        """Find best mushroom to clear for strategic advantage"""
+        if not self.game_state.mushroom_analyzer or not self.game_state.bug_blaster_pos:
+            # Fallback: find nearest mushroom in safe zone
+            safe_mushrooms = [
+                m for m in self.game_state.mushrooms
+                if m.y >= self.game_state.safe_zone_y
+            ]
+            if safe_mushrooms:
+                return min(
+                    safe_mushrooms,
+                    key=lambda m: self.game_state.bug_blaster_pos.distance_to(m)
+                )
+            return None
+        
+        # Use advanced analysis
+        blaster_tuple = (self.game_state.bug_blaster_pos.x, self.game_state.bug_blaster_pos.y)
+        centipede_positions = [
+            pos for c in self.game_state.centipedes for pos in c.body
+        ]
+        
+        # Calculate priority for each mushroom
+        mushroom_priorities = []
+        for mushroom in self.game_state.mushrooms:
+            if mushroom.y >= self.game_state.safe_zone_y - 5:  # In or near safe zone
+                priority = self.game_state.mushroom_analyzer.calculate_clear_priority(
+                    (mushroom.x, mushroom.y),
+                    blaster_tuple,
+                    centipede_positions
+                )
+                mushroom_priorities.append((mushroom, priority))
+        
+        if mushroom_priorities:
+            mushroom_priorities.sort(key=lambda mp: mp[1], reverse=True)
+            return mushroom_priorities[0][0]
+        
+        return None
+
+
+class StrategyManager:
+    """Manages overall strategy and decision making"""
+    
+    def __init__(self, game_state: GameState):
+        self.game_state = game_state
+        self.pathfinder = PathFinder(game_state)
+        self.targeting = TargetingSystem(game_state)
+        self.last_safe_pos: Optional[Position] = None
+        
+        # Strategy state
+        self.current_strategy = "AGGRESSIVE"  # AGGRESSIVE, DEFENSIVE, CLEARING, POSITIONING
+        self.strategy_timer = 0
+        self.stuck_counter = 0
+        
+    def decide_action(self) -> str:
+        """Main decision function - returns action command"""
+        if not self.game_state.bug_blaster_pos:
+            return ""
+        
+        current_pos = self.game_state.bug_blaster_pos
+        
+        # Log performance stats periodically
+        if self.game_state.step % 100 == 0:
+            stats = self.game_state.get_performance_stats()
+            logger.info(f"Performance: {stats}")
+            
+            # Detect stuck centipedes
+            stuck = self.game_state.detect_stuck_centipedes()
+            if stuck:
+                logger.warning(f"Stuck centipedes detected: {stuck}")
+        
+        # Update strategy based on game state
+        self._update_strategy()
+        
+        # PRIORITY 0: Immediate shot if perfectly aligned (before emergency check)
+        # This ensures we never miss a perfect shot even when in slight danger
+        if self.game_state.centipedes:
+            for centipede in self.game_state.centipedes:
+                for seg_x, seg_y in centipede.body:
+                    if seg_x == current_pos.x and seg_y < current_pos.y:
+                        # Check if path is perfectly clear
+                        clear = True
+                        for y in range(seg_y + 1, current_pos.y):
+                            if Position(current_pos.x, y) in self.game_state.mushrooms:
+                                clear = False
+                                break
+                        if clear and (current_pos.y - seg_y) <= 5:  # Close enough
+                            logger.debug(f"PERFECT SHOT at {seg_x},{seg_y}")
+                            return "A"
+        
+        # PRIORITY 1: Emergency evasion
+        if self._is_in_immediate_danger(current_pos):
+            logger.warning(f"EMERGENCY! Position {current_pos.to_tuple()} is dangerous!")
+            escape_action = self._emergency_escape()
+            if escape_action:
+                logger.info(f"Emergency escape: {escape_action}")
+                return escape_action
+        
+        # PRIORITY 2: Shoot if we have a clear shot (but not in danger)
+        should_shoot, reason = self.targeting.should_shoot()
+        if should_shoot:
+            logger.debug(f"Shooting: {reason}")
+            return "A"
+        
+        # Execute current strategy
+        if self.current_strategy == "AGGRESSIVE":
+            action = self._aggressive_strategy()
+        elif self.current_strategy == "DEFENSIVE":
+            action = self._defensive_strategy()
+        elif self.current_strategy == "CLEARING":
+            action = self._clearing_strategy()
+        elif self.current_strategy == "POSITIONING":
+            action = self._positioning_strategy()
+        else:
+            action = self._default_strategy()
+        
+        if action:
+            return action
+        
+        # FALLBACK: Smart patrol
+        return self._smart_patrol()
+    
+    def _update_strategy(self):
+        """Update current strategy based on game state"""
+        self.strategy_timer += 1
+        
+        # Count nearby threats
+        threat_count = sum(
+            1 for d in self.game_state.danger_zones
+            if d.distance_to(self.game_state.bug_blaster_pos) <= 5
+        )
+        
+        # Count centipedes
+        centipede_count = len(self.game_state.centipedes)
+        
+        # Check if centipedes are nearby
+        centipedes_nearby = False
+        if self.game_state.centipedes:
+            nearest = self.game_state.get_nearest_centipede_head()
+            if nearest:
+                dist = self.game_state.bug_blaster_pos.distance_to(nearest.head)
+                if dist < 10:
+                    centipedes_nearby = True
+        
+        # Count mushrooms in movement area
+        mushroom_count = sum(
+            1 for m in self.game_state.mushrooms
+            if m.y >= self.game_state.safe_zone_y
+        )
+        
+        # Decide strategy
+        if threat_count > 10:
+            if self.current_strategy != "DEFENSIVE":
+                logger.info("Switching to DEFENSIVE strategy")
+            self.current_strategy = "DEFENSIVE"
+            self.strategy_timer = 0
+        
+        elif centipedes_nearby and centipede_count > 0:
+            # If centipedes are nearby, be aggressive!
+            if self.current_strategy != "AGGRESSIVE":
+                logger.info("Switching to AGGRESSIVE strategy - centipedes nearby!")
+            self.current_strategy = "AGGRESSIVE"
+            self.strategy_timer = 0
+        
+        elif mushroom_count > 20 and threat_count < 5 and not centipedes_nearby:
+            if self.current_strategy != "CLEARING":
+                logger.info("Switching to CLEARING strategy")
+            self.current_strategy = "CLEARING"
+            self.strategy_timer = 0
+        
+        elif self.game_state.step < 300 and not centipedes_nearby:
+            # Early game: position well only if no centipedes nearby
+            if self.current_strategy != "POSITIONING":
+                logger.info("Switching to POSITIONING strategy")
+            self.current_strategy = "POSITIONING"
+            self.strategy_timer = 0
+        
+        else:
+            # Default to aggressive when in doubt
+            if self.current_strategy != "AGGRESSIVE":
+                logger.info("Switching to AGGRESSIVE strategy (default)")
+            self.current_strategy = "AGGRESSIVE"
+            self.strategy_timer = 0
+    
+    def _aggressive_strategy(self) -> Optional[str]:
+        """Aggressive strategy: actively hunt centipedes"""
+        current_pos = self.game_state.bug_blaster_pos
+        
+        # HIGHEST PRIORITY: Shoot at ANY centipede segment if aligned
+        if self.game_state.centipedes:
+            for centipede in self.game_state.centipedes:
+                for i, (seg_x, seg_y) in enumerate(centipede.body):
+                    if seg_x == current_pos.x and seg_y < current_pos.y:
+                        # Check if path is clear
+                        clear = True
+                        for y in range(seg_y + 1, current_pos.y):
+                            if Position(current_pos.x, y) in self.game_state.mushrooms:
+                                clear = False
+                                break
+                        if clear:
+                            is_head = (i == 0 or i == len(centipede.body) - 1)
+                            logger.debug(f"Aggressive shot at {'head' if is_head else 'segment'} at {seg_x},{seg_y}")
+                            return "A"
+        
+        # Check if we should shoot at nearest centipede (even if not perfectly aligned)
+        if self.game_state.centipedes:
+            nearest_centipede = self.game_state.get_nearest_centipede_head()
+            if nearest_centipede:
+                head = nearest_centipede.head
+                # If centipede is above us and close to our column, try to shoot
+                if abs(head.x - current_pos.x) <= 1 and head.y < current_pos.y:
+                    # Check if path is mostly clear
+                    mushrooms_in_path = sum(
+                        1 for m in self.game_state.mushrooms
+                        if m.x == current_pos.x and m.y < current_pos.y and m.y > head.y
+                    )
+                    if mushrooms_in_path == 0:  # Strict: path must be clear
+                        logger.debug(f"Aggressive shot at centipede head at {head.to_tuple()}")
+                        return "A"
+        
+        # Move to best shooting position
+        best_pos = self.targeting.get_best_shooting_position()
+        if best_pos and best_pos != current_pos:
+            # But check if it's safe
+            if not self._is_in_immediate_danger(best_pos):
+                move = self._get_move_towards(current_pos, best_pos)
+                if move:
+                    logger.debug(f"Aggressive move towards {best_pos.to_tuple()}")
+                    return move
+        
+        # If centipede is nearby but not in our column, move towards it
+        if self.game_state.centipedes:
+            nearest = self.game_state.get_nearest_centipede_head()
+            if nearest and nearest.head.y < current_pos.y:
+                # Try to align with centipede
+                if abs(nearest.head.x - current_pos.x) > 1:
+                    target = Position(nearest.head.x, current_pos.y)
+                    if self.game_state.is_safe_position(target):
+                        move = self._get_move_towards(current_pos, target)
+                        if move:
+                            logger.debug(f"Moving to align with centipede at x={nearest.head.x}")
+                            return move
+        
+        # If can't move to shooting position, stay mobile
+        return self._stay_mobile()
+    
+    def _defensive_strategy(self) -> Optional[str]:
+        """Defensive strategy: prioritize survival but shoot when safe"""
+        current_pos = self.game_state.bug_blaster_pos
+        
+        # Even in defensive mode, shoot if we have a clear, safe shot
+        if self.game_state.centipedes:
+            for centipede in self.game_state.centipedes:
+                for seg_x, seg_y in centipede.body:
+                    # Only shoot if centipede is far enough (safe)
+                    if seg_x == current_pos.x and seg_y < current_pos.y and (current_pos.y - seg_y) > 3:
+                        # Check for clear shot
+                        clear = True
+                        for y in range(seg_y + 1, current_pos.y):
+                            if Position(current_pos.x, y) in self.game_state.mushrooms:
+                                clear = False
+                                break
+                        if clear:
+                            logger.debug(f"Defensive: safe shot at {seg_x},{seg_y}")
+                            return "A"
+        
+        # Find safest position in bottom rows
+        safest_pos = self._find_safest_position_in_safe_zone()
+        if safest_pos:
+            move = self._get_move_towards(current_pos, safest_pos)
+            if move:
+                logger.debug(f"Defensive move towards {safest_pos.to_tuple()}")
+                return move
+        
+        return self._stay_mobile()
+    
+    def _clearing_strategy(self) -> Optional[str]:
+        """Clear mushrooms to create better tactical positions"""
+        current_pos = self.game_state.bug_blaster_pos
+        
+        # Find mushroom to clear
+        mushroom = self.targeting.find_mushroom_to_clear()
+        if mushroom:
+            # Position to shoot mushroom
+            if mushroom.x == current_pos.x and mushroom.y < current_pos.y:
+                # Can shoot it
+                logger.debug(f"Clearing mushroom at {mushroom.to_tuple()}")
+                return "A"
+            else:
+                # Move to align
+                target = Position(mushroom.x, current_pos.y)
+                if self.game_state.is_safe_position(target):
+                    move = self._get_move_towards(current_pos, target)
+                    if move:
+                        return move
+        
+        return None
+    
+    def _positioning_strategy(self) -> Optional[str]:
+        """Position for optimal play"""
+        current_pos = self.game_state.bug_blaster_pos
+        
+        # If centipedes appear, shoot them first!
+        if self.game_state.centipedes:
+            # Check ALL centipede segments, not just heads
+            for centipede in self.game_state.centipedes:
+                for seg_x, seg_y in centipede.body:
+                    if seg_x == current_pos.x and seg_y < current_pos.y:
+                        # Check for clear shot
+                        clear = True
+                        for m in self.game_state.mushrooms:
+                            if m.x == current_pos.x and seg_y < m.y < current_pos.y:
+                                clear = False
+                                break
+                        if clear:
+                            logger.debug(f"Positioning strategy: opportunistic shot at {seg_x},{seg_y}")
+                            return "A"
+        
+        # Move to center of safe zone for flexibility
+        ideal_x = self.game_state.map_width // 2
+        ideal_y = self.game_state.map_height - 3
+        
+        ideal_pos = Position(ideal_x, ideal_y)
+        
+        if current_pos.distance_to(ideal_pos) > 2:
+            move = self._get_move_towards(current_pos, ideal_pos)
+            if move:
+                logger.debug("Positioning for optimal play")
+                return move
+        
+        return None
+    
+    def _default_strategy(self) -> Optional[str]:
+        """Default balanced strategy"""
+        return self._aggressive_strategy()
+    
+    def _is_in_immediate_danger(self, pos: Position) -> bool:
+        """Check if position is in immediate danger"""
+        # Check if in danger zone
+        if pos in self.game_state.danger_zones:
+            return True
+        
+        # Check proximity to centipede segments
+        for centipede in self.game_state.centipedes:
+            for seg_x, seg_y in centipede.body:
+                if abs(pos.x - seg_x) <= 1 and abs(pos.y - seg_y) <= 1:
                     return True
+        
+        # Use threat analyzer if available
+        if self.game_state.threat_analyzer:
+            centipede_bodies = [c.body for c in self.game_state.centipedes]
+            mushroom_tuples = {(m.x, m.y) for m in self.game_state.mushrooms}
+            
+            # Get predictions
+            all_predictions = []
+            if self.game_state.predictor:
+                for centipede in self.game_state.centipedes:
+                    predictions = self.game_state.predictor.predict_trajectory(
+                        centipede.body,
+                        centipede.direction,
+                        mushroom_tuples,
+                        num_steps=5
+                    )
+                    all_predictions.append(predictions)
+            
+            assessment = self.game_state.threat_analyzer.assess_position(
+                (pos.x, pos.y),
+                centipede_bodies,
+                all_predictions,
+                mushroom_tuples
+            )
+            
+            if assessment.threat_level >= 0.7:
+                logger.warning(f"High threat at {pos.to_tuple()}: {assessment.threat_sources}")
+                return True
+        
         return False
     
-    def _find_safest_column(self) -> int:
-        """
-        Encontra coluna com maior distância média a todas as centipedes.
+    def _emergency_escape(self) -> Optional[str]:
+        """Find quickest escape from danger"""
+        current = self.game_state.bug_blaster_pos
         
-        Retorna:
-            int: Coluna X mais segura
-        """
-        if not self.centipedes:
-            return PREFERRED_CENTER_X
-        
-        # Calcular score de segurança para cada coluna
-        column_scores = {}
-        
-        for x in range(MAP_WIDTH):
-            total_dist = 0
-            for centipede in self.centipedes:
-                body = centipede.get("body", [])
-                for seg_x, seg_y in body:
-                    dist = abs(x - seg_x) + abs(self.player_pos[1] - seg_y) * 0.5
-                    total_dist += dist
+        # Use threat analyzer if available
+        if self.game_state.threat_analyzer:
+            danger_tuples = {(d.x, d.y) for d in self.game_state.danger_zones}
+            mushroom_tuples = {(m.x, m.y) for m in self.game_state.mushrooms}
             
-            column_scores[x] = total_dist
-        
-        # Retornar coluna com maior score (mais longe de centipedes)
-        safest_column = max(column_scores, key=column_scores.get)
-        return safest_column
-    
-    def _is_safe_move(self, new_x: int, new_y: int) -> bool:
-        """
-        Verifica se movimento para (new_x, new_y) é seguro.
-        
-        Critérios:
-        - Dentro dos limites do mapa
-        - Não há mushroom na posição
-        - Não há centipede na posição
-        
-        Args:
-            new_x, new_y: Posição destino
+            safe_positions = self.game_state.threat_analyzer.find_safe_retreat_positions(
+                (current.x, current.y),
+                danger_tuples,
+                mushroom_tuples,
+                max_distance=3
+            )
             
-        Retorna:
-            bool: True se movimento é seguro
-        """
-        # Limites do mapa
-        if not (0 <= new_x < MAP_WIDTH and 0 <= new_y < MAP_HEIGHT):
-            return False
+            if safe_positions:
+                best_retreat = safe_positions[0][0]
+                retreat_pos = Position(best_retreat[0], best_retreat[1])
+                move = self._get_move_towards(current, retreat_pos)
+                if move:
+                    return move
         
-        # Mushroom?
-        if (new_x, new_y) in self.mushrooms:
-            return False
+        # Fallback: try all directions and pick the safest
+        moves = [
+            ('w', Position(current.x, current.y - 1)),
+            ('s', Position(current.x, current.y + 1)),
+            ('a', Position(current.x - 1, current.y)),
+            ('d', Position(current.x + 1, current.y))
+        ]
         
-        # Centipede?
-        for centipede in self.centipedes:
-            body = centipede.get("body", [])
-            if (new_x, new_y) in body:
-                return False
+        # Sort by safety (distance from danger)
+        safe_moves = []
+        for cmd, pos in moves:
+            if self.game_state.is_safe_position(pos):
+                min_danger_dist = min(
+                    (pos.distance_to(d) for d in self.game_state.danger_zones),
+                    default=100
+                )
+                safe_moves.append((min_danger_dist, cmd))
         
-        return True
-    
-    def _is_in_good_position(self) -> bool:
-        """
-        Verifica se jogador está em posição tática favorável.
+        if safe_moves:
+            safe_moves.sort(reverse=True)  # Furthest from danger first
+            return safe_moves[0][1]
         
-        Critérios:
-        - Próximo do centro horizontal
-        - Na zona ideal vertical
-        - Sem mushrooms bloqueando caminho acima
-        
-        Retorna:
-            bool: True se posição é boa
-        """
-        if not self.player_pos:
-            return False
-        
-        player_x, player_y = self.player_pos
-        
-        # Critério 1: Proximidade ao centro
-        if abs(player_x - PREFERRED_CENTER_X) > 5:
-            return False
-        
-        # Critério 2: Linha ideal
-        if not (IDEAL_MIN_Y <= player_y <= IDEAL_MIN_Y + 3):
-            return False
-        
-        # Critério 3: Caminho livre acima (relaxado) — já não é obrigatório
-        return True
-    
-    def _has_accessible_targets(self) -> bool:
-        """
-        Verifica se há alvos que podem ser atingidos.
-        
-        Retorna:
-            bool: True se há pelo menos um alvo acessível
-        """
-        target = self._get_best_target()
-        return target is not None
-    
-    def _find_mushroom_in_column(self, column: int) -> Optional[tuple[int, int]]:
-        """
-        Encontra mushroom mais próximo na coluna especificada.
-        
-        Args:
-            column: Coluna X a procurar
-            
-        Retorna:
-            tuple[int, int]: (x, y) do mushroom ou None
-        """
-        if not self.player_pos:
-            return None
-        
-        player_x, player_y = self.player_pos
-        closest_mushroom = None
-        min_dist = float('inf')
-        
-        for mx, my in self.mushrooms:
-            if mx == column and my < player_y:
-                dist = player_y - my
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_mushroom = (mx, my)
-        
-        return closest_mushroom
-    
-    def _random_safe_move(self, prefer_vertical: bool = False) -> Optional[str]:
-        """
-        Fallback: tenta mover aleatoriamente mas com segurança.
-        
-        Retorna:
-            str: Ação segura ou None
-        """
-        if not self.player_pos:
-            return None
-        
-        player_x, player_y = self.player_pos
-        # Preferir vertical para quebrar padrões de bounce em obstáculos
-        if prefer_vertical:
-            moves = [
-                ("s", player_x, player_y + 1),
-                ("w", player_x, player_y - 1),
-                ("d", player_x + 1, player_y),
-                ("a", player_x - 1, player_y),
-            ]
-        else:
-            moves = [
-                ("d", player_x + 1, player_y),
-                ("a", player_x - 1, player_y),
-                ("w", player_x, player_y - 1),
-                ("s", player_x, player_y + 1),
-            ]
-        
-        for action, new_x, new_y in moves:
-            if self._is_safe_move(new_x, new_y):
-                return action
+        # Desperate: any move that doesn't immediately kill us
+        for cmd, pos in moves:
+            if 0 <= pos.x < self.game_state.map_width and 0 <= pos.y < self.game_state.map_height:
+                if pos not in self.game_state.mushrooms:
+                    return cmd
         
         return None
+    
+    def _get_move_towards(self, current: Position, target: Position) -> Optional[str]:
+        """Get single move command towards target"""
+        path = self.pathfinder.find_path(current, target)
+        
+        if path and len(path) > 0:
+            next_pos = path[0]
+            dx = next_pos.x - current.x
+            dy = next_pos.y - current.y
+            
+            if dy < 0:
+                return 'w'
+            elif dy > 0:
+                return 's'
+            elif dx < 0:
+                return 'a'
+            elif dx > 0:
+                return 'd'
+        
+        # If pathfinding failed, try direct movement
+        dx = target.x - current.x
+        dy = target.y - current.y
+        
+        # Prioritize larger movement
+        if abs(dx) > abs(dy):
+            if dx > 0:
+                new_pos = Position(current.x + 1, current.y)
+                if self.game_state.is_safe_position(new_pos):
+                    return 'd'
+            elif dx < 0:
+                new_pos = Position(current.x - 1, current.y)
+                if self.game_state.is_safe_position(new_pos):
+                    return 'a'
+        
+        if dy > 0:
+            new_pos = Position(current.x, current.y + 1)
+            if self.game_state.is_safe_position(new_pos):
+                return 's'
+        elif dy < 0:
+            new_pos = Position(current.x, current.y - 1)
+            if self.game_state.is_safe_position(new_pos):
+                return 'w'
+        
+        return None
+    
+    def _find_safest_position_in_safe_zone(self) -> Optional[Position]:
+        """Find the safest position in the bottom safe zone"""
+        safest_pos = None
+        max_safety = -1
+        
+        for x in range(self.game_state.map_width):
+            for y in range(self.game_state.safe_zone_y, self.game_state.map_height):
+                pos = Position(x, y)
+                
+                if not self.game_state.is_safe_position(pos):
+                    continue
+                
+                # Calculate safety score
+                safety_score = 0
+                
+                # Distance from danger
+                min_danger_dist = min(
+                    (pos.distance_to(d) for d in self.game_state.danger_zones),
+                    default=100
+                )
+                safety_score += min_danger_dist * 10
+                
+                # Prefer center positions
+                center_dist = abs(x - self.game_state.map_width // 2)
+                safety_score -= center_dist
+                
+                if safety_score > max_safety:
+                    max_safety = safety_score
+                    safest_pos = pos
+        
+        return safest_pos
+    
+    def _stay_mobile(self) -> str:
+        """Make small movements to stay mobile and ready"""
+        current = self.game_state.bug_blaster_pos
+        
+        # PRIORITY: Try to shoot if we have opportunity
+        if self.game_state.centipedes:
+            for centipede in self.game_state.centipedes:
+                for seg_x, seg_y in centipede.body:
+                    if seg_x == current.x and seg_y < current.y:
+                        # Check if path is clear
+                        clear = True
+                        for y in range(seg_y + 1, current.y):
+                            if Position(current.x, y) in self.game_state.mushrooms:
+                                clear = False
+                                break
+                        if clear:
+                            logger.debug(f"Stay mobile: opportunistic shot at {seg_x},{seg_y}")
+                            return 'A'
+        
+        # If there are centipedes, try to position better for shooting
+        if self.game_state.centipedes:
+            nearest = self.game_state.get_nearest_centipede_head()
+            if nearest and nearest.head.y < current.y:
+                # Try to align horizontally with centipede
+                if abs(nearest.head.x - current.x) > 2:
+                    if nearest.head.x < current.x:
+                        return 'a'
+                    else:
+                        return 'd'
+        
+        # Prefer horizontal movement in safe zone, avoiding edges
+        if current.x < 3:
+            return 'd'
+        elif current.x > self.game_state.map_width - 4:
+            return 'a'
+        elif current.x < self.game_state.map_width // 3:
+            return 'd'
+        elif current.x > 2 * self.game_state.map_width // 3:
+            return 'a'
+        else:
+            # Small movement based on step to vary position
+            if self.game_state.step % 6 < 3:
+                return 'd'
+            else:
+                return 'a'
+    
+    def _smart_patrol(self) -> str:
+        """Smart patrol movements - actively seek centipedes"""
+        current = self.game_state.bug_blaster_pos
+        
+        # PRIORITY: Try to shoot if aligned with any centipede
+        if self.game_state.centipedes:
+            for centipede in self.game_state.centipedes:
+                for seg_x, seg_y in centipede.body:
+                    if seg_x == current.x and seg_y < current.y:
+                        # Check if path is clear
+                        clear = True
+                        for y in range(seg_y + 1, current.y):
+                            if Position(current.x, y) in self.game_state.mushrooms:
+                                clear = False
+                                break
+                        if clear:
+                            logger.debug(f"Smart patrol: shooting at {seg_x},{seg_y}")
+                            return 'A'
+        
+        # If there are centipedes, try to position under them
+        if self.game_state.centipedes:
+            nearest = self.game_state.get_nearest_centipede_head()
+            if nearest and nearest.head.y < current.y:
+                # Try to move towards the centipede's x position
+                if nearest.head.x < current.x - 1:
+                    return 'a'
+                elif nearest.head.x > current.x + 1:
+                    return 'd'
+                # If we're roughly aligned, move up a bit if safe
+                elif current.y > self.game_state.safe_zone_y:
+                    target = Position(current.x, current.y - 1)
+                    if self.game_state.is_safe_position(target):
+                        return 'w'
+        
+        # Default patrol behavior - avoid edges
+        if current.x <= 2:
+            return 'd'
+        elif current.x >= self.game_state.map_width - 3:
+            return 'a'
+        else:
+            # Move towards center slightly
+            if current.x < self.game_state.map_width // 2:
+                return 'd'
+            else:
+                return 'a'
 
-    def _is_oscillating(self) -> bool:
-        """
-        Deteta padrão de oscilação horizontal (ex.: a,d,a,d) sem progresso de X.
-        """
-        if len(self._action_history) < 4 or len(self._pos_history) < 4:
-            return False
-        last_actions = list(self._action_history)[-4:]
-        pattern1 = last_actions == ["a", "d", "a", "d"]
-        pattern2 = last_actions == ["d", "a", "d", "a"]
-        if not (pattern1 or pattern2):
-            return False
-        xs = [pos[0] for pos in self._pos_history][-4:]
-        return max(xs) - min(xs) <= 1
-
-
-# ============================================================================
-# LOOP PRINCIPAL DO AGENTE
-# ============================================================================
 
 async def agent_loop(server_address="localhost:8000", agent_name="student"):
-    """
-    Loop principal de comunicação com o servidor.
-    
-    Baseado em client.py, mas sem Pygame (apenas lógica de agente).
-    
-    Args:
-        server_address: Endereço do servidor (host:port)
-        agent_name: Nome do agente (aparecerá nos highscores)
-    """
-    # Criar agente
-    agent = CentipedeAgent()
-    
-    # Conectar ao servidor via WebSocket
+    """Main agent loop"""
     async with websockets.connect(f"ws://{server_address}/player") as websocket:
-        # Enviar comando de join
+        # Join game
         await websocket.send(json.dumps({"cmd": "join", "name": agent_name}))
+        logger.info(f"Agent {agent_name} joined the game")
         
-        print(f"[{agent_name}] Conectado ao servidor {server_address}")
-        print(f"[{agent_name}] Modo inicial: {agent.current_mode.value}")
-        try:
-            if getattr(agent, "_log_path", None):
-                print(f"[{agent_name}] Logging: {agent._log_path}")
-        except Exception:
-            pass
+        # Initialize game state
+        game_state = GameState()
+        strategy_manager = StrategyManager(game_state)
         
-        # Loop principal do jogo
-        try:
-            while True:
-                # Receber estado do jogo
-                state_json = await websocket.recv()
-                state = json.loads(state_json)
-                
-                # Atualizar agente com novo estado
-                agent.update(state)
-                
-                # Decidir ação
-                action = agent.decide_action()
-                
-                # Log periódico (a cada 100 frames)
-                if agent.step % 100 == 0:
-                    print(f"[Step {agent.step}] Score: {agent.score} | "
-                          f"Modo: {agent.current_mode.value} | "
-                          f"Pos: {agent.player_pos} | "
-                          f"Centipedes: {len(agent.centipedes)}")
-                
-                # Enviar ação ao servidor (se houver)
-                if action:
-                    await websocket.send(json.dumps({"cmd": "key", "key": action}))
-                else:
-                    # Enviar string vazia se sem ação
-                    await websocket.send(json.dumps({"cmd": "key", "key": ""}))
+        # Display window for human viewing (optional)
+        SCREEN = pygame.display.set_mode((299, 123))
+        SPRITES = pygame.image.load("data/pad.png").convert_alpha()
+        SCREEN.blit(SPRITES, (0, 0))
         
-        except websockets.exceptions.ConnectionClosedOK:
-            print(f"[{agent_name}] Servidor fechou conexão (jogo terminou)")
-            print(f"[{agent_name}] Score final: {agent.score} em {agent.step} steps")
-        except Exception as e:
-            print(f"[{agent_name}] Erro: {e}")
+        frame_count = 0
+        
+        while True:
+            try:
+                # Receive game state
+                state = json.loads(await websocket.recv())
+                
+                # Update our game state
+                game_state.update(state)
+                
+                # Log important events
+                if frame_count % 50 == 0:
+                    logger.info(f"Step: {game_state.step}, Score: {game_state.score}, "
+                              f"Centipedes: {len(game_state.centipedes)}, "
+                              f"Mushrooms: {len(game_state.mushrooms)}")
+                
+                # Decide action with error handling
+                try:
+                    key = strategy_manager.decide_action()
+                except Exception as action_error:
+                    # Log the error but don't crash - use a safe fallback
+                    logger.error(f"Error deciding action: {action_error}", exc_info=True)
+                    # Fallback: simple patrol movement
+                    if game_state.bug_blaster_pos:
+                        if game_state.bug_blaster_pos.x < game_state.map_width // 2:
+                            key = 'd'
+                        else:
+                            key = 'a'
+                    else:
+                        key = ''  # No action if position unknown
+                
+                # Send action
+                await websocket.send(json.dumps({"cmd": "key", "key": key}))
+                
+                # Handle pygame events
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        pygame.quit()
+                        return
+                
+                pygame.display.flip()
+                frame_count += 1
+                
+            except websockets.exceptions.ConnectionClosedOK:
+                logger.info("Server has cleanly disconnected us")
+                return
+            except Exception as e:
+                logger.error(f"Error in agent loop: {e}", exc_info=True)
+                break
 
 
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
-
+# Run the agent
 if __name__ == "__main__":
-    """
-    Ponto de entrada do script.
-    
-    Pode-se customizar via variáveis de ambiente:
-    - SERVER: endereço do servidor (default: localhost)
-    - PORT: porta (default: 8000)
-    - NAME: nome do agente (default: student)
-    """
-    # Ler configuração de environment variables
+    loop = asyncio.get_event_loop()
     SERVER = os.environ.get("SERVER", "localhost")
     PORT = os.environ.get("PORT", "8000")
-    NAME = os.environ.get("NAME", "student")
+    NAME = os.environ.get("NAME", getpass.getuser())
     
-    # Executar loop do agente
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(agent_loop(f"{SERVER}:{PORT}", NAME))
-
-
-# ============================================================================
-# SECÇÃO DE MELHORIAS FUTURAS (TODO/IDEIAS)
-# ============================================================================
-
-"""
-TODO / IDEIAS DE EVOLUÇÃO:
-
-1. MELHORIAS NAS HEURÍSTICAS:
-   - Priorizar segmentos de centipede mais altos (linha Y < 5) ainda mais
-   - Adicionar heurística para evitar ficar encurralado entre mushrooms
-   - Implementar "pathfinding" simples (BFS) para encontrar caminho até coluna segura
-   
-2. NOVOS MODOS FSM:
-   - CLEAR_PATH: Modo dedicado a limpar mushrooms estrategicamente
-   - AGGRESSIVE: Modo ultra-agressivo quando score está baixo perto do timeout
-   - DEFENSIVE: Modo ultra-defensivo quando há muitas centipedes simultâneas
-   
-3. OTIMIZAÇÕES:
-   - Cache de cálculos pesados (ex: _find_safest_column)
-   - Prever movimento das centipedes (1-2 frames à frente)
-   - Usar A* para pathfinding em vez de movimentos greedy
-   
-4. TRATAMENTO DE CASOS ESPECIAIS:
-   - Detectar padrões de "aprisionamento" e forçar escape
-   - Priorizar destruir mushrooms que estão no caminho de centipedes (para forçá-las a descer)
-   - Implementar "kiting" (ficar longe mas disparando constantemente)
-   
-5. TUNING DE PARÂMETROS:
-   - Ajustar DANGER_DISTANCE_LINES baseado no número de centipedes
-   - Ajustar TARGET_HEIGHT_WEIGHT dinamicamente (mais agressivo no início, defensivo no fim)
-   - Adicionar randomização leve para evitar loops determinísticos
-   
-6. DEBUG E ANÁLISE:
-   - Adicionar flag --verbose para logs detalhados
-   - Gravar replays de jogos para análise offline
-   - Estatísticas: % de tempo em cada modo, accuracy de disparos, etc.
-   
-7. MULTIAGENTE (se permitido):
-   - Coordenar múltiplos agentes (cada um cobre uma zona do mapa)
-   - Sistema de "comunicação" via estado compartilhado
-"""
+    try:
+        loop.run_until_complete(agent_loop(f"{SERVER}:{PORT}", NAME))
+    except KeyboardInterrupt:
+        logger.info("Agent stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
