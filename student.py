@@ -31,13 +31,15 @@ except ImportError:
     logging.warning("Analysis modules not available, using basic strategies")
 
 # Configure logging
+# Ensure log file is always created next to this file (not depending on cwd)
+LOG_DIR = os.path.dirname(__file__)
+LOG_PATH = os.path.join(LOG_DIR, 'agent_debug.log')
+file_handler = logging.FileHandler(LOG_PATH, encoding='utf-8')
+stream_handler = logging.StreamHandler()
 logging.basicConfig(
     level=logging.DEBUG,  # Changed to DEBUG for more detailed logs
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('agent_debug.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[file_handler, stream_handler]
 )
 logger = logging.getLogger('CentipedeAgent')
 
@@ -144,6 +146,12 @@ class GameState:
         self.shots_fired = 0
         self.mushrooms_destroyed = 0
         
+        # Futile chase detection
+        self.shot_attempts: Dict[Tuple[int, int], int] = {}  # (x, y) -> count
+        self.last_shot_target: Optional[Tuple[int, int]] = None
+        self.consecutive_misses = 0
+        self.chase_cooldowns: Dict[str, int] = {}  # centipede_name -> step to resume
+        
     def update(self, state: dict):
         """Update game state from server message"""
         if 'bug_blaster' in state:
@@ -193,6 +201,10 @@ class GameState:
             if score_gain >= 100:  # Hit a centipede
                 self.hits_made += 1
                 logger.info(f"HIT! Score +{score_gain}. Total hits: {self.hits_made}")
+                # Reset futile chase tracking on successful hit
+                self.shot_attempts.clear()
+                self.consecutive_misses = 0
+                self.last_shot_target = None
         
         # Update danger zones
         self._update_danger_zones()
@@ -337,6 +349,71 @@ class TargetingSystem:
         self.game_state = game_state
         self.last_shot_step = 0
     
+    def _is_futile_chase(self, target: Tuple[int, int], centipede: Centipede) -> bool:
+        """
+        Detect if shooting at this target is a futile chase.
+        A chase is futile when:
+        - We've shot at similar positions multiple times without hitting
+        - The centipede is moving horizontally away from us
+        - Player and centipede have same speed, so we can never catch up
+        """
+        # Check if this centipede is on chase cooldown
+        if centipede.name in self.game_state.chase_cooldowns:
+            cooldown_until = self.game_state.chase_cooldowns[centipede.name]
+            if self.game_state.step < cooldown_until:
+                logger.debug(f"Centipede {centipede.name} on chase cooldown until step {cooldown_until}")
+                return True
+        
+        # Track shot attempts at this position
+        if self.game_state.last_shot_target:
+            # Check if we're chasing horizontally
+            last_x, last_y = self.game_state.last_shot_target
+            curr_x, curr_y = target
+            
+            # Horizontal chase: x is changing, y is similar
+            if abs(curr_y - last_y) <= 2:  # Same row or nearby
+                # If we've been chasing for several shots without hitting
+                if self.game_state.consecutive_misses >= 3:
+                    # Check if centipede is moving away horizontally
+                    if len(centipede.body) >= 2:
+                        head_x, head_y = centipede.body[0]
+                        blaster_x = self.game_state.bug_blaster_pos.x
+                        
+                        # Is centipede moving away from us horizontally?
+                        distance_increasing = abs(head_x - blaster_x) > 3
+                        
+                        if distance_increasing:
+                            # This is a futile chase!
+                            logger.warning(f"FUTILE CHASE detected! Centipede {centipede.name} at {target}, "
+                                         f"consecutive misses: {self.game_state.consecutive_misses}")
+                            # Put centipede on cooldown
+                            self.game_state.chase_cooldowns[centipede.name] = self.game_state.step + 15
+                            return True
+        
+        return False
+    
+    def _record_shot_attempt(self, target: Tuple[int, int]):
+        """Record a shot attempt at a target"""
+        # Update consecutive misses tracking
+        if self.game_state.last_shot_target:
+            last_x, last_y = self.game_state.last_shot_target
+            curr_x, curr_y = target
+            
+            # If shooting at similar position (horizontal chase)
+            if abs(curr_y - last_y) <= 2:
+                self.game_state.consecutive_misses += 1
+            else:
+                # Different row, reset counter
+                self.game_state.consecutive_misses = 0
+        
+        self.game_state.last_shot_target = target
+        
+        # Track attempts at this position
+        if target in self.game_state.shot_attempts:
+            self.game_state.shot_attempts[target] += 1
+        else:
+            self.game_state.shot_attempts[target] = 1
+    
     def should_shoot(self) -> Tuple[bool, str]:
         """
         Determine if we should shoot now
@@ -354,9 +431,15 @@ class TargetingSystem:
         
         best_shot_value = 0
         best_shot_target = None
+        best_shot_centipede = None
         
         # Check each centipede segment
         for centipede in self.game_state.centipedes:
+            # Skip if this centipede is on chase cooldown
+            if centipede.name in self.game_state.chase_cooldowns:
+                if self.game_state.step < self.game_state.chase_cooldowns[centipede.name]:
+                    continue
+            
             for i, (seg_x, seg_y) in enumerate(centipede.body):
                 if seg_x == blaster_x and seg_y < blaster_y:
                     # Check if path is clear (no mushrooms in the way)
@@ -380,8 +463,15 @@ class TargetingSystem:
                         if shot_value > best_shot_value:
                             best_shot_value = shot_value
                             best_shot_target = (seg_x, seg_y)
+                            best_shot_centipede = centipede
         
-        if best_shot_value > 20:  # Lower threshold for more aggressive shooting
+        if best_shot_value > 20 and best_shot_target and best_shot_centipede:
+            # Check if this would be a futile chase
+            if self._is_futile_chase(best_shot_target, best_shot_centipede):
+                return (False, f"Futile chase avoided at {best_shot_target}")
+            
+            # Record the shot attempt
+            self._record_shot_attempt(best_shot_target)
             self.last_shot_step = self.game_state.step
             self.game_state.shots_fired += 1
             return (True, f"Good shot at {best_shot_target}, value={best_shot_value}")
@@ -522,8 +612,14 @@ class StrategyManager:
         
         # PRIORITY 0: Immediate shot if perfectly aligned (before emergency check)
         # This ensures we never miss a perfect shot even when in slight danger
+        # BUT we need to avoid futile horizontal chases
         if self.game_state.centipedes:
             for centipede in self.game_state.centipedes:
+                # Skip centipedes on chase cooldown
+                if centipede.name in self.game_state.chase_cooldowns:
+                    if self.game_state.step < self.game_state.chase_cooldowns[centipede.name]:
+                        continue
+                
                 for seg_x, seg_y in centipede.body:
                     if seg_x == current_pos.x and seg_y < current_pos.y:
                         # Check if path is perfectly clear
@@ -533,12 +629,35 @@ class StrategyManager:
                                 clear = False
                                 break
                         if clear and (current_pos.y - seg_y) <= 5:  # Close enough
+                            target = (seg_x, seg_y)
+                            # Check if this would be a futile chase
+                            if self.targeting._is_futile_chase(target, centipede):
+                                logger.debug(f"Skipping PERFECT SHOT at {seg_x},{seg_y} - futile chase")
+                                continue
+                            
+                            # Record shot attempt and shoot
+                            self.targeting._record_shot_attempt(target)
                             logger.debug(f"PERFECT SHOT at {seg_x},{seg_y}")
                             return "A"
         
+        # PRIORITY 0.5: Safe vertical shot - shoot centipede directly above even if in danger
+        # This is based on game mechanics: when we shoot a centipede above us,
+        # it spawns a mushroom and turns away, so we're safe if we don't move
+        can_shoot_safe, target = self._can_safely_shoot_vertical(current_pos)
+        if can_shoot_safe:
+            logger.info(f"SAFE VERTICAL SHOT! Shooting centipede at {target} instead of evading")
+            return "A"
+        
         # PRIORITY 1: Emergency evasion
+        # Only evade if we DON'T have a safe vertical shot available
         if self._is_in_immediate_danger(current_pos):
             logger.warning(f"EMERGENCY! Position {current_pos.to_tuple()} is dangerous!")
+            # Double-check: do we have a safe shot before evading?
+            can_shoot_safe, target = self._can_safely_shoot_vertical(current_pos)
+            if can_shoot_safe:
+                logger.info(f"EMERGENCY OVERRIDE: Safe shot available at {target}, shooting instead of evading!")
+                return "A"
+            
             escape_action = self._emergency_escape()
             if escape_action:
                 logger.info(f"Emergency escape: {escape_action}")
@@ -635,8 +754,14 @@ class StrategyManager:
         current_pos = self.game_state.bug_blaster_pos
         
         # HIGHEST PRIORITY: Shoot at ANY centipede segment if aligned
+        # BUT avoid futile horizontal chases
         if self.game_state.centipedes:
             for centipede in self.game_state.centipedes:
+                # Skip centipedes on chase cooldown
+                if centipede.name in self.game_state.chase_cooldowns:
+                    if self.game_state.step < self.game_state.chase_cooldowns[centipede.name]:
+                        continue
+                
                 for i, (seg_x, seg_y) in enumerate(centipede.body):
                     if seg_x == current_pos.x and seg_y < current_pos.y:
                         # Check if path is clear
@@ -646,7 +771,14 @@ class StrategyManager:
                                 clear = False
                                 break
                         if clear:
+                            target = (seg_x, seg_y)
+                            # Check if this would be a futile chase
+                            if self.targeting._is_futile_chase(target, centipede):
+                                logger.debug(f"Skipping aggressive shot at {seg_x},{seg_y} - futile chase")
+                                continue
+                            
                             is_head = (i == 0 or i == len(centipede.body) - 1)
+                            self.targeting._record_shot_attempt(target)
                             logger.debug(f"Aggressive shot at {'head' if is_head else 'segment'} at {seg_x},{seg_y}")
                             return "A"
         
@@ -781,6 +913,39 @@ class StrategyManager:
     def _default_strategy(self) -> Optional[str]:
         """Default balanced strategy"""
         return self._aggressive_strategy()
+    
+    def _can_safely_shoot_vertical(self, pos: Position) -> Tuple[bool, Optional[Tuple[int, int]]]:
+        """
+        Check if we can safely shoot at a centipede directly above us.
+        Based on game mechanics: shooting a centipede directly above is always safe
+        because it spawns a mushroom and the centipede turns away, so if we don't move,
+        we won't be hit.
+        
+        Returns: (can_shoot, target_position)
+        """
+        if not self.game_state.centipedes:
+            return (False, None)
+        
+        # Check each centipede for segments directly above us
+        for centipede in self.game_state.centipedes:
+            for seg_x, seg_y in centipede.body:
+                # Is it directly above us?
+                if seg_x == pos.x and seg_y < pos.y:
+                    # Check if path is clear (no mushrooms blocking)
+                    clear = True
+                    for y in range(seg_y + 1, pos.y):
+                        if Position(pos.x, y) in self.game_state.mushrooms:
+                            clear = False
+                            break
+                    
+                    if clear:
+                        # This is a safe shot!
+                        # When we hit: mushroom spawns, centipede turns/splits
+                        # If we don't move after shooting, we're safe
+                        logger.info(f"SAFE VERTICAL SHOT available at ({seg_x},{seg_y}), distance={pos.y - seg_y}")
+                        return (True, (seg_x, seg_y))
+        
+        return (False, None)
     
     def _is_in_immediate_danger(self, pos: Position) -> bool:
         """Check if position is in immediate danger"""
