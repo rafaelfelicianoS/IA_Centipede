@@ -30,24 +30,20 @@ except ImportError:
     ANALYSIS_AVAILABLE = False
     logging.warning("Analysis modules not available, using basic strategies")
 
-# Configure logging: place log next to this file and use UTF-8
-LOG_DIR = os.path.dirname(__file__)
-LOG_PATH = os.path.join(LOG_DIR, 'agent_debug.log')
-file_handler = logging.FileHandler(LOG_PATH, encoding='utf-8')
-stream_handler = logging.StreamHandler()
+# Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.DEBUG,  # Changed to DEBUG for more detailed logs
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[file_handler, stream_handler]
+    handlers=[
+        logging.FileHandler('agent_debug.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger('CentipedeAgent')
 
-try:
-    pygame.init()
-    program_icon = pygame.image.load("data/icon2.png")
-    pygame.display.set_icon(program_icon)
-except Exception:
-    logger.debug("pygame init or icon load failed; continuing without icon")
+pygame.init()
+program_icon = pygame.image.load("data/icon2.png")
+pygame.display.set_icon(program_icon)
 
 
 @dataclass
@@ -320,7 +316,7 @@ class GameState:
                 return True
         
         return False
-        
+
 
 
 class PathFinder:
@@ -772,15 +768,14 @@ class StrategyManager:
         # Count centipedes
         centipede_count = len(self.game_state.centipedes)
         
-        # Check if centipedes are nearby - AUMENTADO O RANGE para 15
+        # Check if centipedes are nearby
         centipedes_nearby = False
         if self.game_state.centipedes:
             nearest = self.game_state.get_nearest_centipede_head()
             if nearest:
                 dist = self.game_state.bug_blaster_pos.distance_to(nearest.head)
-                if dist < 15:  # AUMENTADO de 10 para 15
+                if dist < 10:
                     centipedes_nearby = True
-                    logger.debug(f"Centipede nearby at distance {dist}")
         
         # Count mushrooms in movement area
         mushroom_count = sum(
@@ -788,19 +783,18 @@ class StrategyManager:
             if m.y >= self.game_state.safe_zone_y
         )
         
-        # Decide strategy - PRIORIDADE MUDADA!
-        # ALTA PRIORIDADE: Se há centopeia, seja agressivo!
-        if centipedes_nearby and centipede_count > 0:
-            # If centipedes are nearby, be aggressive! (MOVED TO TOP PRIORITY)
-            if self.current_strategy != "AGGRESSIVE":
-                logger.info("Switching to AGGRESSIVE strategy - centipedes nearby!")
-            self.current_strategy = "AGGRESSIVE"
-            self.strategy_timer = 0
-        
-        elif threat_count > 10:
+        # Decide strategy
+        if threat_count > 10:
             if self.current_strategy != "DEFENSIVE":
                 logger.info("Switching to DEFENSIVE strategy")
             self.current_strategy = "DEFENSIVE"
+            self.strategy_timer = 0
+        
+        elif centipedes_nearby and centipede_count > 0:
+            # If centipedes are nearby, be aggressive!
+            if self.current_strategy != "AGGRESSIVE":
+                logger.info("Switching to AGGRESSIVE strategy - centipedes nearby!")
+            self.current_strategy = "AGGRESSIVE"
             self.strategy_timer = 0
         
         elif mushroom_count > 20 and threat_count < 5 and not centipedes_nearby:
@@ -809,8 +803,8 @@ class StrategyManager:
             self.current_strategy = "CLEARING"
             self.strategy_timer = 0
         
-        elif self.game_state.step < 300 and not centipedes_nearby and centipede_count == 0:
-            # Early game: position well ONLY if NO centipedes exist at all
+        elif self.game_state.step < 300 and not centipedes_nearby:
+            # Early game: position well only if no centipedes nearby
             if self.current_strategy != "POSITIONING":
                 logger.info("Switching to POSITIONING strategy")
             self.current_strategy = "POSITIONING"
@@ -976,22 +970,13 @@ class StrategyManager:
         
         ideal_pos = Position(ideal_x, ideal_y)
         
-        # CORREÇÃO: Verificar se já está perto o suficiente
-        distance = current_pos.distance_to(ideal_pos)
-        if distance > 2:
+        if current_pos.distance_to(ideal_pos) > 2:
             move = self._get_move_towards(current_pos, ideal_pos)
             if move:
-                logger.debug(f"Positioning for optimal play (distance={distance})")
+                logger.debug("Positioning for optimal play")
                 return move
-            else:
-                # Se não consegue se mover em direção à posição ideal,
-                # mude para patrulha inteligente
-                logger.debug("Can't reach ideal position, switching to smart patrol")
-                return self._smart_patrol()
         
-        # Se já está na posição ideal, patrulhe
-        logger.debug("Already at ideal position, patrolling")
-        return self._smart_patrol()
+        return None
     
     def _default_strategy(self) -> Optional[str]:
         """Default balanced strategy"""
@@ -1000,46 +985,14 @@ class StrategyManager:
     def _can_safely_shoot_vertical(self, pos: Position) -> Tuple[bool, Optional[Tuple[int, int]]]:
         """
         Check if we can safely shoot at a centipede directly above us.
-        IMPORTANT: This is only safe if there are NO centipedes approaching horizontally!
+        Based on game mechanics: shooting a centipede directly above is always safe
+        because it spawns a mushroom and the centipede turns away, so if we don't move,
+        we won't be hit.
         
         Returns: (can_shoot, target_position)
         """
         if not self.game_state.centipedes:
             return (False, None)
-        
-        # CRITICAL FIX: Check for horizontal threats FIRST
-        # If we're going to shoot and stay still, we need to make sure no centipede 
-        # can hit us horizontally while we're shooting
-        for centipede in self.game_state.centipedes:
-            for seg_x, seg_y in centipede.body:
-                # Check if centipede is on our row or 1 row above/below
-                if abs(seg_y - pos.y) <= 1:
-                    # Check if it's close horizontally (within 3 tiles)
-                    if abs(seg_x - pos.x) <= 3:
-                        # Too dangerous - centipede could hit us while we're shooting!
-                        logger.debug(f"UNSAFE vertical shot: centipede at ({seg_x},{seg_y}) too close horizontally")
-                        return (False, None)
-        
-        # Now check for vertical shot opportunities
-        for centipede in self.game_state.centipedes:
-            for seg_x, seg_y in centipede.body:
-                # Is it directly above us?
-                if seg_x == pos.x and seg_y < pos.y:
-                    # Check if path is clear (no mushrooms blocking)
-                    clear = True
-                    for y in range(seg_y + 1, pos.y):
-                        if Position(pos.x, y) in self.game_state.mushrooms:
-                            clear = False
-                            break
-                    
-                    if clear:
-                        # This is a safe shot!
-                        # When we hit: mushroom spawns, centipede turns/splits
-                        # If we don't move after shooting, we're safe (assuming no horizontal threats)
-                        logger.info(f"SAFE VERTICAL SHOT available at ({seg_x},{seg_y}), distance={pos.y - seg_y}")
-                        return (True, (seg_x, seg_y))
-        
-        return (False, None)
         
         # Check each centipede for segments directly above us
         for centipede in self.game_state.centipedes:
