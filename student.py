@@ -3,7 +3,7 @@ Autonomous Agent for Centipede Game
 Authors: AI Centipede Team
 Strategy: Multi-layered intelligent agent with prediction, pathfinding, and adaptive tactics
 """
-
+#Fix ao player n ir para as cobras stuck quando elas n estão perto
 import asyncio
 import getpass
 import json
