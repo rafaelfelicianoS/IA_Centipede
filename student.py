@@ -18,6 +18,18 @@ import os
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional, Set
 import math
+import logging
+
+# Configure logging with both file and console output
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('agent_debug.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('CentipedeAgent')
 
 # Game constants
 DIRECTIONS = {
@@ -226,17 +238,25 @@ class CentipedeAgent:
                 if seg_pos.y >= my_pos.y - 2:  # Near or below us
                     threat_below = True
         
+        old_strategy = self.current_strategy
+        
         if min_distance < 4 and threat_below:
             self.current_strategy = "defensive"
+            if old_strategy != "defensive":
+                logger.info(f"Switching to DEFENSIVE strategy - centipede at distance {min_distance:.1f}")
             return
         
         # CLEARING: Too many mushrooms (> 150)
         if mushroom_count > 150:
             self.current_strategy = "clearing"
+            if old_strategy != "clearing":
+                logger.info(f"Switching to CLEARING strategy - {mushroom_count} mushrooms")
             return
         
         # AGGRESSIVE: Default - hunt and kill
         self.current_strategy = "aggressive"
+        if old_strategy != "aggressive":
+            logger.info("Switching to AGGRESSIVE strategy")
     
     def find_best_target(self) -> Optional[Tuple[str, Tuple[int, int], float]]:
         """
@@ -578,6 +598,7 @@ class CentipedeAgent:
                 seg_pos = Position(*segment)
                 if my_pos.manhattan_distance(seg_pos) <= 1:
                     # Immediate threat - find any safe move
+                    logger.warning(f"EMERGENCY! Centipede at {segment} adjacent to position {my_pos.to_tuple()}")
                     return self.find_safe_move()
         
         return None
@@ -607,16 +628,19 @@ class CentipedeAgent:
         # 1. Bottom-row escape
         if action := self.evade_bottom_row_snake():
             self.debug_info['reason'] = 'bottom_row_escape'
+            logger.info(f"Bottom-row escape: {action}")
             return action
         
         # 2. Horizontal trap escape
         if action := self.detect_horizontal_trap():
             self.debug_info['reason'] = 'horizontal_trap'
+            logger.info(f"Horizontal trap escape: {action}")
             return action
         
         # 3. Emergency evade
         if action := self.emergency_evade():
             self.debug_info['reason'] = 'emergency_evade'
+            logger.info(f"Emergency evade: {action}")
             return action
         
         # 4. Defensive strategy
@@ -635,6 +659,7 @@ class CentipedeAgent:
                     if self.is_safe_to_shoot():
                         self.debug_info['reason'] = 'defensive_safe_shot'
                         self.shot_cooldown = 10
+                        logger.debug(f"Defensive safe shot at {target_pos}")
                         return 'A'
                 else:
                     # Não alinhados - tentar alinhar se for seguro
@@ -644,18 +669,22 @@ class CentipedeAgent:
                             self.debug_info['reason'] = 'defensive_align_right'
                             move = self.find_safe_move('d')
                             if move == 'd':  # Só move se for seguro
+                                logger.debug(f"Defensive align right towards {target_pos}")
                                 return move
                         elif my_pos.x > target_x:
                             self.debug_info['reason'] = 'defensive_align_left'
                             move = self.find_safe_move('a')
                             if move == 'a':  # Só move se for seguro
+                                logger.debug(f"Defensive align left towards {target_pos}")
                                 return move
             
             # Mover para safe zone e evadir
             if my_pos.y < self.safe_zone_start:
                 action = self.find_safe_move('s')
+                logger.debug(f"Defensive: moving to safe zone")
             else:
                 action = self.find_safe_move()
+                logger.debug(f"Defensive: safe movement")
             return action
         
         # 5. Aggressive shooting
@@ -679,24 +708,29 @@ class CentipedeAgent:
                     if path_clear and self.shot_cooldown == 0:
                         self.debug_info['reason'] = 'shooting_target'
                         self.shot_cooldown = 10
+                        logger.debug(f"Aggressive shot at {target_pos}, score={target_score:.1f}")
                         return 'A'
                     elif not path_clear and self.shot_cooldown == 0:
                         # Shoot mushroom blocking path
                         self.debug_info['reason'] = 'clearing_shot_path'
                         self.shot_cooldown = 10
+                        logger.debug(f"Clearing mushroom in shot path to {target_pos}")
                         return 'A'
                 
                 # Move towards target column
                 if my_pos.x < target_x:
                     self.debug_info['reason'] = 'aligning_right'
+                    logger.debug(f"Aligning right to target at x={target_x}")
                     return self.find_safe_move('d')
                 elif my_pos.x > target_x:
                     self.debug_info['reason'] = 'aligning_left'
+                    logger.debug(f"Aligning left to target at x={target_x}")
                     return self.find_safe_move('a')
         
         # 6. Clearing mushrooms
         if self.current_strategy == "clearing":
             self.debug_info['reason'] = 'clearing_mode'
+            logger.debug("Clearing mode: shooting mushrooms")
             # Shoot upward to clear mushrooms
             if self.shot_cooldown == 0:
                 self.shot_cooldown = 10
@@ -707,6 +741,7 @@ class CentipedeAgent:
         # 7. Return to home row (safe zone)
         if my_pos.y < self.safe_zone_start:
             self.debug_info['reason'] = 'return_to_safe_zone'
+            logger.debug(f"Returning to safe zone from y={my_pos.y} to y>={self.safe_zone_start}")
             return self.find_safe_move('s')
         
         # 8. Center horizontally
@@ -714,13 +749,16 @@ class CentipedeAgent:
         if abs(my_pos.x - center_x) > 3:
             if my_pos.x < center_x:
                 self.debug_info['reason'] = 'centering_right'
+                logger.debug(f"Centering: moving right from x={my_pos.x}")
                 return self.find_safe_move('d')
             else:
                 self.debug_info['reason'] = 'centering_left'
+                logger.debug(f"Centering: moving left from x={my_pos.x}")
                 return self.find_safe_move('a')
         
         # 9. Fallback
         self.debug_info['reason'] = 'fallback_safe'
+        logger.debug("Fallback: safe movement")
         return self.find_safe_move()
     
     def get_mushroom_positions(self) -> Set[Tuple[int, int]]:
@@ -738,6 +776,7 @@ async def agent_loop(server_address="localhost:8000", agent_name="student"):
     async with websockets.connect(f"ws://{server_address}/player") as websocket:
         # Join game
         await websocket.send(json.dumps({"cmd": "join", "name": agent_name}))
+        logger.info(f"Agent {agent_name} joined the game")
         
         while True:
             try:
@@ -747,22 +786,42 @@ async def agent_loop(server_address="localhost:8000", agent_name="student"):
                 # Update agent state
                 agent.update_state(state)
                 
-                # Decide action
-                key = agent.decide_action()
-                agent.last_action = key
+                # Log important events periodically
+                if agent.frame_count % 50 == 0:
+                    score = state.get('score', 0)
+                    num_centipedes = len(state.get('centipedes', []))
+                    num_mushrooms = len(state.get('mushrooms', []))
+                    logger.info(f"Step: {agent.frame_count}, Score: {score}, "
+                              f"Strategy: {agent.current_strategy}, "
+                              f"Centipedes: {num_centipedes}, "
+                              f"Mushrooms: {num_mushrooms}")
+                
+                # Decide action with error handling
+                try:
+                    key = agent.decide_action()
+                    agent.last_action = key
+                except Exception as action_error:
+                    # Log the error but don't crash
+                    logger.error(f"Error deciding action: {action_error}", exc_info=True)
+                    # Fallback: safe movement
+                    key = agent.find_safe_move()
+                    if not key:
+                        key = ''
                 
                 # Send action
                 await websocket.send(json.dumps({"cmd": "key", "key": key}))
                 
-                # Debug output every 50 frames
-                if agent.frame_count % 50 == 0:
-                    print(f"Frame {agent.frame_count}: Strategy={agent.current_strategy}, "
-                          f"Action={key}, Reason={agent.debug_info.get('reason', 'none')}, "
-                          f"Score={state.get('score', 0)}")
+                # Debug output with reason
+                if agent.frame_count % 100 == 0 and agent.debug_info.get('reason'):
+                    logger.debug(f"Action: {key}, Reason: {agent.debug_info.get('reason')}, "
+                               f"Position: {agent.game_state.get('bug_blaster', {}).get('pos', 'unknown')}")
                 
             except websockets.exceptions.ConnectionClosedOK:
-                print("Server disconnected")
+                logger.info("Server has cleanly disconnected us")
                 return
+            except Exception as e:
+                logger.error(f"Error in agent loop: {e}", exc_info=True)
+                break
 
 
 # Entry point
@@ -770,4 +829,10 @@ if __name__ == "__main__":
     SERVER = os.environ.get("SERVER", "localhost")
     PORT = os.environ.get("PORT", "8000")
     NAME = os.environ.get("NAME", getpass.getuser())
-    asyncio.run(agent_loop(f"{SERVER}:{PORT}", NAME))
+    
+    try:
+        asyncio.run(agent_loop(f"{SERVER}:{PORT}", NAME))
+    except KeyboardInterrupt:
+        logger.info("Agent stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
