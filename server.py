@@ -88,20 +88,23 @@ class GameServer:
 
         original_group = group
         if isinstance(group, dict):
-            group = group.keys()
+            iterable = list(group.keys())
+        else:
+            iterable = list(group)
 
-        for client in group:
+        for client in iterable:
             try:
                 await client.send(json.dumps(info))
             except Exception:
                 logger.error("Could not send %s to client %s, removing", info, client)
                 to_remove.append(client)
+                await client.close()
+
         for client in to_remove:
             if isinstance(original_group, dict):
-                del original_group[client]
+                original_group.pop(client, None)
             else:
-                original_group.remove(client)
-            await client.close()
+                original_group.discard(client)
 
     async def incomming_handler(self, websocket: WebSocketCommonProtocol, path: str):
         """Process new clients arriving at the server."""
