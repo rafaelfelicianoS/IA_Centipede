@@ -96,12 +96,12 @@ class GameServer:
             except Exception:
                 logger.error("Could not send %s to client %s, removing", info, client)
                 to_remove.append(client)
-                await client.close()
         for client in to_remove:
             if isinstance(original_group, dict):
                 del original_group[client]
             else:
                 original_group.remove(client)
+            await client.close()
 
     async def incomming_handler(self, websocket: WebSocketCommonProtocol, path: str):
         """Process new clients arriving at the server."""
