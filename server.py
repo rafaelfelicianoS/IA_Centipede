@@ -98,7 +98,6 @@ class GameServer:
             except Exception:
                 logger.error("Could not send %s to client %s, removing", info, client)
                 to_remove.append(client)
-
         for client in to_remove:
             if isinstance(original_group, dict):
                 del original_group[client]
