@@ -1131,6 +1131,9 @@ class CentipedeAgent:
     def detect_horizontal_trap(self) -> Optional[str]:
         """
         Detect if we're trapped horizontally by mushrooms
+        
+        IMPORTANT: Does NOT act when there's an immediate threat (centipede within 2 tiles).
+        This prevents interference with emergency evasion logic.
         """
         bug_blaster = self.game_state.get('bug_blaster', {})
         
@@ -1139,6 +1142,16 @@ class CentipedeAgent:
             return None
         
         my_pos = Position(*bug_blaster['pos'])
+        
+        # CORRECTION: Don't interfere with emergency logic when centipede is very close
+        # If any centipede segment is within distance 2, let emergency_evade handle it
+        centipedes = self.game_state.get('centipedes', [])
+        for centipede in centipedes:
+            for segment in centipede['body']:
+                seg_pos = Position(*segment)
+                if my_pos.manhattan_distance(seg_pos) <= 2:
+                    return None  # Let emergency logic take over
+        
         mushrooms = self.get_mushroom_positions()
         
         # Check if we're surrounded horizontally
@@ -1291,6 +1304,26 @@ class CentipedeAgent:
         # Use prediction-based filtering to find safest escape
         # Try all directions plus staying still
         candidate_actions = ['w', 'a', 's', 'd', '']
+        
+        # CORRECTION: Don't flee vertically towards an adjacent centipede head
+        # If head is immediately above, don't go up; if below, don't go down
+        for centipede in centipedes:
+            if not centipede['body']:
+                continue
+            head = centipede['body'][-1]  # Head is always last element
+            head_x, head_y = head
+            
+            # Check if head is immediately above (same column, 1 row up)
+            if head_x == my_pos.x and head_y == my_pos.y - 1:
+                if 'w' in candidate_actions:
+                    candidate_actions.remove('w')
+                    logger.debug(f"Emergency: Excluded 'w' - head immediately above at ({head_x}, {head_y})")
+            
+            # Check if head is immediately below (same column, 1 row down)
+            if head_x == my_pos.x and head_y == my_pos.y + 1:
+                if 's' in candidate_actions:
+                    candidate_actions.remove('s')
+                    logger.debug(f"Emergency: Excluded 's' - head immediately below at ({head_x}, {head_y})")
         
         safest = self.get_safest_action_with_prediction(candidate_actions, my_pos)
         if safest:
