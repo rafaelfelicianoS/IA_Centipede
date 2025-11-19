@@ -412,6 +412,123 @@ class CentipedeAgent:
                     if 0 <= adj[0] < self.map_size[0] and 0 <= adj[1] < self.map_size[1]:
                         self.danger_zones.add(adj)
     
+    def will_be_hit_soon(self, pos: Position, horizon: int = 2) -> bool:
+        """
+        Predictive death check: Will any centipede HEAD reach this position 
+        within the next 'horizon' steps?
+        
+        This is critical because the game moves centipedes BEFORE processing
+        bug blaster movement. So even if we "decide" to flee, if a centipede
+        head will be at our target position in the next frame, we die.
+        
+        Args:
+            pos: Position to check (where we would be after moving)
+            horizon: Number of future steps to check (1-2 recommended)
+        
+        Returns:
+            True if position will be hit by a centipede head soon (DANGEROUS)
+            False if position appears safe from predicted head positions
+        """
+        pos_tuple = pos.to_tuple()
+        
+        # Check all centipede predictions
+        for name, predictions in self.predicted_positions.items():
+            # Check up to horizon steps ahead
+            for step_idx in range(min(horizon, len(predictions))):
+                predicted_head = predictions[step_idx]
+                if predicted_head == pos_tuple:
+                    logger.debug(f"⚠️ PREDICTED DEATH: Centipede '{name}' head will be at {pos_tuple} in step {step_idx + 1}")
+                    return True
+        
+        # Also check current head positions (step 0)
+        centipedes = self.game_state.get('centipedes', [])
+        for centipede in centipedes:
+            body = centipede['body']
+            if body:
+                current_head = tuple(body[-1])  # Head is last element
+                if current_head == pos_tuple:
+                    logger.debug(f"⚠️ IMMEDIATE DEATH: Centipede head currently at {pos_tuple}")
+                    return True
+        
+        return False
+    
+    def get_safest_action_with_prediction(self, candidate_actions: list, my_pos: Position) -> Optional[str]:
+        """
+        Given a list of candidate actions, filter out those that lead to predicted death
+        and return the safest one based on distance from threats.
+        
+        Args:
+            candidate_actions: List of actions to evaluate ['a', 'd', 'w', 's', '']
+            my_pos: Current position
+        
+        Returns:
+            Safest action, or None if all are dangerous
+        """
+        mushrooms = self.get_mushroom_positions()
+        centipedes = self.game_state.get('centipedes', [])
+        
+        safe_actions = []
+        risky_actions = []  # Actions that might be hit but are better than certain death
+        
+        for action in candidate_actions:
+            # Calculate new position
+            if action == '':
+                new_pos = my_pos
+            else:
+                if action not in DIRECTIONS:
+                    continue
+                dx, dy = DIRECTIONS[action]
+                new_pos = Position(my_pos.x + dx, my_pos.y + dy)
+            
+            # Check if move is valid
+            if new_pos.x < 0 or new_pos.x >= self.map_size[0]:
+                continue
+            if new_pos.y < 0 or new_pos.y >= self.map_size[1]:
+                continue
+            if new_pos.to_tuple() in mushrooms:
+                continue
+            
+            # Check if move leads to immediate centipede collision
+            immediate_collision = False
+            for centipede in centipedes:
+                if new_pos.to_tuple() in [tuple(seg) for seg in centipede['body']]:
+                    immediate_collision = True
+                    break
+            
+            if immediate_collision:
+                continue
+            
+            # Check predicted death
+            if self.will_be_hit_soon(new_pos, horizon=2):
+                # This action leads to predicted death, but might be better than nothing
+                min_dist = float('inf')
+                for centipede in centipedes:
+                    for segment in centipede['body']:
+                        dist = new_pos.manhattan_distance(Position(*segment))
+                        min_dist = min(min_dist, dist)
+                risky_actions.append((action, min_dist))
+            else:
+                # Safe from predicted death - calculate distance score
+                min_dist = float('inf')
+                for centipede in centipedes:
+                    for segment in centipede['body']:
+                        dist = new_pos.manhattan_distance(Position(*segment))
+                        min_dist = min(min_dist, dist)
+                safe_actions.append((action, min_dist))
+        
+        # Prefer safe actions (sorted by distance, farther is better)
+        if safe_actions:
+            safe_actions.sort(key=lambda x: x[1], reverse=True)
+            return safe_actions[0][0]
+        
+        # If no safe actions, pick the least risky
+        if risky_actions:
+            risky_actions.sort(key=lambda x: x[1], reverse=True)
+            logger.warning(f"⚠️ No safe actions available, choosing least risky: {risky_actions[0][0]}")
+            return risky_actions[0][0]
+        
+        return None
+    
     def evaluate_strategy(self):
         """Choose between AGGRESSIVE, DEFENSIVE, or CLEARING"""
         bug_blaster = self.game_state.get('bug_blaster', {})
@@ -477,6 +594,9 @@ class CentipedeAgent:
         
         for centipede in centipedes:
             for segment in centipede['body']:
+
+
+
                 seg_pos = Position(*segment)
                 dist = my_pos.manhattan_distance(seg_pos)
                 if dist < min_distance:
@@ -789,6 +909,14 @@ class CentipedeAgent:
                 else:
                     score -= 300
             
+            # CRITICAL: Predictive death check
+            # If moving here means a centipede head will hit us in the next 1-2 steps,
+            # apply massive penalty. This is the main protection against "decided to flee
+            # but died anyway" scenarios where the game moves centipedes first.
+            if self.will_be_hit_soon(new_pos, horizon=2):
+                score -= 5000  # Massive penalty - almost always avoid
+                logger.debug(f"⚠️ Predicted death penalty for action '{action}' to {new_pos.to_tuple()}")
+            
             # Distance to nearest centipede (bigger = better)
             min_centipede_dist = float('inf')
             for centipede in centipedes:
@@ -823,10 +951,14 @@ class CentipedeAgent:
                     score += 500  # Dominant bonus to override distance penalties
                     logger.debug(f"Returning to safe zone: MASSIVE bonus for 's' (moving from y={my_pos.y} to y={new_pos.y})")
             
-            # Move toward center bonus (avoid edges)
-            center_x = self.map_size[0] // 2
-            distance_to_center = abs(new_pos.x - center_x)
-            score -= distance_to_center * 2
+            # CENTERING DISABLED:
+            # Antes: penalizávamos a distância ao centro do mapa para puxar o agente
+            # para o meio. Isso está agora comentado para não interferir com o foco
+            # em seguir/matar cobras específicas.
+            #
+            # center_x = self.map_size[0] // 2
+            # distance_to_center = abs(new_pos.x - center_x)
+            # score -= distance_to_center * 2
             
             # Prefer requested direction
             if preferred_direction and action == preferred_direction:
@@ -858,6 +990,9 @@ class CentipedeAgent:
         """
         Special case: Avoid dying when cornered on last row
         Only active on last row
+        
+        CRITICAL IMPROVEMENT: Uses prediction-based safety to avoid "decided to flee
+        but died anyway" scenarios where the game moves centipedes before the blaster.
         """
         bug_blaster = self.game_state.get('bug_blaster', {})
         
@@ -890,23 +1025,44 @@ class CentipedeAgent:
         right_threat = any(x > my_pos.x for x in threats)
         sandwiched = left_threat and right_threat
         
-        # Try to go UP
-        up_pos = (my_pos.x, my_pos.y - 1)
-        if up_pos not in mushrooms:
-            if sandwiched:
-                # Go up even if danger zone (emergency)
-                return 'w'
-            elif up_pos not in self.danger_zones:
-                return 'w'
+        # Build candidate actions based on threat position
+        candidate_actions = []
         
-        # Move sideways away from closest segment
+        # Try UP first (most desirable escape from bottom row)
+        up_pos = Position(my_pos.x, my_pos.y - 1)
+        up_blocked = up_pos.to_tuple() in mushrooms or my_pos.y - 1 < 0
+        
+        if not up_blocked:
+            # Check if up is safe from predicted death
+            if not self.will_be_hit_soon(up_pos, horizon=2):
+                if sandwiched or up_pos.to_tuple() not in self.danger_zones:
+                    logger.debug(f"Bottom row escape: going UP (prediction-safe)")
+                    return 'w'
+            else:
+                logger.debug(f"⚠️ Bottom row: UP blocked by predicted death at {up_pos.to_tuple()}")
+        
+        # Sideways escape - determine candidate directions
         if threats:
             closest_threat = min(threats, key=lambda x: abs(x - my_pos.x))
+            
+            # Prefer direction away from threat, but evaluate both
             if closest_threat < my_pos.x:
-                # Threat on left, go right
+                # Threat on left, prefer right
+                candidate_actions = ['d', 'a', 'w', '']
+            else:
+                # Threat on right, prefer left
+                candidate_actions = ['a', 'd', 'w', '']
+            
+            # Use prediction-based filtering to choose safest action
+            safest = self.get_safest_action_with_prediction(candidate_actions, my_pos)
+            if safest:
+                logger.debug(f"Bottom row escape: prediction-filtered choice '{safest}'")
+                return safest
+            
+            # Fallback to find_safe_move which now includes prediction penalty
+            if closest_threat < my_pos.x:
                 return self.find_safe_move('d')
             else:
-                # Threat on right, go left
                 return self.find_safe_move('a')
         
         return None
@@ -1019,6 +1175,12 @@ class CentipedeAgent:
                         safe_pos in mushrooms or
                         safe_pos in self.danger_zones):
                         return False
+                    
+                    # CRITICAL: Check if escape position will be hit by predicted centipede movement
+                    safe_position = Position(safe_pos[0], safe_pos[1])
+                    if self.will_be_hit_soon(safe_position, horizon=2):
+                        logger.debug(f"⚠️ Shoot unsafe: escape position {safe_pos} will be hit soon")
+                        return False
         
         # Se há cobra na coluna, já verificamos a segurança acima
         # Se não há cobra, podemos atirar livremente (para limpar cogumelos)
@@ -1027,6 +1189,9 @@ class CentipedeAgent:
     def emergency_evade(self) -> Optional[str]:
         """
         Emergency evasion when in immediate danger
+        
+        CRITICAL IMPROVEMENT: Uses prediction-based safety to avoid fleeing into
+        a position where a centipede head will arrive in the next frame.
         """
         bug_blaster = self.game_state.get('bug_blaster', {})
         
@@ -1039,15 +1204,32 @@ class CentipedeAgent:
         centipedes = self.game_state.get('centipedes', [])
         
         # Check if any centipede segment is adjacent
+        immediate_threat = False
         for centipede in centipedes:
             for segment in centipede['body']:
                 seg_pos = Position(*segment)
                 if my_pos.manhattan_distance(seg_pos) <= 1:
-                    # Immediate threat - find any safe move
-                    logger.warning(f"EMERGENCY! Centipede at {segment} adjacent to position {my_pos.to_tuple()}")
-                    return self.find_safe_move()
+                    immediate_threat = True
+                    break
+            if immediate_threat:
+                break
         
-        return None
+        if not immediate_threat:
+            return None
+        
+        logger.warning(f"EMERGENCY! Centipede adjacent to position {my_pos.to_tuple()}")
+        
+        # Use prediction-based filtering to find safest escape
+        # Try all directions plus staying still
+        candidate_actions = ['w', 'a', 's', 'd', '']
+        
+        safest = self.get_safest_action_with_prediction(candidate_actions, my_pos)
+        if safest:
+            logger.info(f"Emergency evade: prediction-filtered choice '{safest}'")
+            return safest
+        
+        # Fallback to find_safe_move which includes prediction penalty
+        return self.find_safe_move()
     
     def decide_focus_hunt_action(self) -> Optional[str]:
         """
@@ -1147,7 +1329,6 @@ class CentipedeAgent:
             # allow clearing shots to open the line (max 3 mushrooms)
             if not line_clear:
                 is_stuck_target = self.focus_target_name in self.stuck_centipedes
-                
                 if is_stuck_target and mushrooms_in_path <= 3 and self.shot_cooldown == 0:
                     # Targeting stuck centipede with blocked path - clear mushrooms
                     if self.is_safe_to_shoot():
@@ -1205,7 +1386,7 @@ class CentipedeAgent:
         5. Aggressive shooting (align, shoot, move)
         6. Clearing mushrooms
         7. Return to home row
-        8. Center horizontally
+        8. Center horizontally  (AGORA DESATIVADO NO CÓDIGO)
         9. Fallback safe move
         """
         bug_blaster = self.game_state.get('bug_blaster', {})
@@ -1336,10 +1517,7 @@ class CentipedeAgent:
                 distance_x = abs(my_pos.x - target_x)
                 
                 # Improved shooting vs aligning decision
-                # ==========================================
-                # We should shoot when "reasonably aligned" to avoid endless microadjustments
-                # Especially important when self-stuck detected
-                
+                # ==========================================                
                 mushrooms = self.get_mushroom_positions()
                 
                 # Check if path would be clear from current position
@@ -1395,27 +1573,17 @@ class CentipedeAgent:
                         return 'A'
                     elif self.late_game and my_pos.x == target_x:
                         # LATE GAME CLEARING SHOTS FOR STUCK CENTIPEDES
-                        # Allow clearing mushrooms in late game ONLY when:
-                        # 1. Target is a stuck centipede
-                        # 2. Mushrooms are blocking the shot path
-                        # 3. It's safe to shoot
-                        # Priority: Kill centipede > clear mushroom path > move elsewhere
                         centipedes = self.game_state.get('centipedes', [])
                         all_stuck = all(c['name'] in self.stuck_centipedes for c in centipedes)
                         if target_name in self.stuck_centipedes:
-                            # Target is a stuck centipede - allow clearing mushrooms to reach it
-                            # This is the key fix: in late game, we can clear mushrooms
-                            # ONLY when they block the path to a stuck centipede target
                             if mushrooms_in_path <= 3 and self.is_safe_to_shoot():
                                 self.debug_info['reason'] = 'late_game_clearing_for_stuck_target'
                                 self.shot_cooldown = 10
                                 logger.info(f"🎯 Late game: clearing {mushrooms_in_path} mushroom(s) to reach stuck centipede '{target_name}'")
                                 return 'A'
                             elif mushrooms_in_path > 3:
-                                # Too many mushrooms - seek different column
                                 logger.debug(f"Late game: too many mushrooms ({mushrooms_in_path}) blocking stuck target, seeking new position")
                         elif all_stuck and self.self_stuck_detected:
-                            # Legacy fallback: all stuck + self-stuck (shouldn't happen often)
                             if self.is_safe_to_shoot():
                                 self.debug_info['reason'] = 'late_game_unstuck_clearing_shot'
                                 self.shot_cooldown = 10
@@ -1448,22 +1616,22 @@ class CentipedeAgent:
             self.debug_info['reason'] = 'return_to_safe_zone'
             logger.info(f"🏠 Returning to safe zone from y={my_pos.y} to y>={self.safe_zone_start}")
             # CRITICAL: Pass returning_to_safe_zone=True to override normal distance-based safety
-            # This allows the agent to descend even when centipedes are below, as long as
-            # it's not an immediate collision. Without this flag, find_safe_move would favor
-            # staying away from centipedes, preventing return to safe zone.
             return self.find_safe_move('s', returning_to_safe_zone=True)
         
-        # 8. Center horizontally
-        center_x = self.map_size[0] // 2
-        if abs(my_pos.x - center_x) > 3:
-            if my_pos.x < center_x:
-                self.debug_info['reason'] = 'centering_right'
-                logger.debug(f"Centering: moving right from x={my_pos.x}")
-                return self.find_safe_move('d')
-            else:
-                self.debug_info['reason'] = 'centering_left'
-                logger.debug(f"Centering: moving left from x={my_pos.x}")
-                return self.find_safe_move('a')
+        # 8. Center horizontally (DESATIVADO)
+        # Toda a lógica de recentrar no meio do mapa foi comentada para não
+        # afastar o agente de cobras presas / posições vantajosas.
+        #
+        # center_x = self.map_size[0] // 2
+        # if abs(my_pos.x - center_x) > 3:
+        #     if my_pos.x < center_x:
+        #         self.debug_info['reason'] = 'centering_right'
+        #         logger.debug(f"Centering: moving right from x={my_pos.x}")
+        #         return self.find_safe_move('d')
+        #     else:
+        #         self.debug_info['reason'] = 'centering_left'
+        #         logger.debug(f"Centering: moving left from x={my_pos.x}")
+        #         return self.find_safe_move('a')
         
         # 9. Fallback
         self.debug_info['reason'] = 'fallback_safe'
