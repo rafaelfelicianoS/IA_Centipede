@@ -16,6 +16,26 @@ Throughout this code, the centipede HEAD is ALWAYS body[-1] (last element).
 The TAIL is body[0] (first element).
 This must be consistent everywhere to avoid oscillation bugs (adadad loops).
 
+CAMPING MODE (v3):
+==================
+When targeting stuck centipedes, the agent enters "camping mode":
+- Stay stationary and shoot continuously when cooldown allows
+- No recentering, no lateral movements, no ADA/ADADA cycles
+- Maintains defensive awareness for threats
+
+Camping mode threats (will exit camping):
+1. Free centipedes approaching in same/adjacent column (within 5 rows)
+2. Free centipedes within 3 rows and descending
+3. Stuck centipede target becomes unstuck
+4. Line of fire blocked by >3 mushrooms (needs repositioning)
+
+Mid game vs Late game behavior:
+- Mid game: Camp only if aligned, no nearby threats (8+ units), clearly safe
+- Late game: Auto-enter camping when aligned with stuck target (priority target)
+
+Camping mode exits only for logical reasons, never by timeout.
+Self-stuck detection is disabled during camping to avoid false positives.
+
 LATE GAME CLEARING LOGIC (v2):
 ==============================
 In late game mode, the agent is authorized to clear mushrooms ONLY when:
@@ -128,6 +148,11 @@ class CentipedeAgent:
         self.late_game = False
         self.focus_target_name = None
         
+        # Camping mode state
+        self.camping_mode = False
+        self.camping_target_name = None
+        self.camping_start_frame = 0
+        
         # Strategy
         self.current_strategy = "aggressive"
         self.target_column = None
@@ -164,6 +189,11 @@ class CentipedeAgent:
         elif not self.late_game and was_late_game:
             logger.info(f"✓ Exiting late game mode - {mushroom_count} mushrooms")
             self.focus_target_name = None  # Reset focus target
+            # Reset camping mode when exiting late game
+            if self.camping_mode:
+                logger.info("🏕️ Exiting camping mode (late game ended)")
+                self.camping_mode = False
+                self.camping_target_name = None
         
         # Reduce cooldown
         if self.shot_cooldown > 0:
@@ -282,7 +312,15 @@ class CentipedeAgent:
         2. All centipedes stuck but blaster not positioned under any of them
         
         Returns True if self-stuck detected
+        
+        NOTE: This detection is DISABLED when camping_mode is active to avoid
+        false positives when the agent is deliberately stationary.
         """
+        # CAMPING MODE OVERRIDE: Skip self-stuck detection when camping
+        # The agent is deliberately stationary, so it's not stuck
+        if self.camping_mode:
+            return False
+        
         bug_blaster = self.game_state.get('bug_blaster', {})
         if not bug_blaster or 'pos' not in bug_blaster:
             return False
@@ -1231,6 +1269,240 @@ class CentipedeAgent:
         # Fallback to find_safe_move which includes prediction penalty
         return self.find_safe_move()
     
+    def check_camping_threats(self) -> Optional[str]:
+        """
+        Check for threats that should break camping mode.
+        
+        Threats considered:
+        1. Free centipedes approaching in same or adjacent column (within 5 rows)
+        2. Free centipedes within 3 rows and descending
+        3. Spiders in danger zone (not implemented - no spider data yet)
+        4. Fleas falling directly on agent's column (not implemented - no flea data yet)
+        5. Stuck centipede target becomes unstuck
+        
+        Returns:
+            - None if no threats (safe to continue camping)
+            - 'unstuck' if target became unstuck
+            - 'threat' if there's a threat requiring evasion
+        """
+        bug_blaster = self.game_state.get('bug_blaster', {})
+        if not bug_blaster or 'pos' not in bug_blaster:
+            return 'threat'
+        
+        my_pos = Position(*bug_blaster['pos'])
+        centipedes = self.game_state.get('centipedes', [])
+        
+        # Check if camping target still exists and is still stuck
+        if self.camping_target_name:
+            target_exists = False
+            target_still_stuck = False
+            
+            for centipede in centipedes:
+                if centipede['name'] == self.camping_target_name:
+                    target_exists = True
+                    if self.camping_target_name in self.stuck_centipedes:
+                        target_still_stuck = True
+                    break
+            
+            # Target died - will need new target, but not a threat per se
+            if not target_exists:
+                logger.info(f"🏕️ Camping target '{self.camping_target_name}' died")
+                return 'unstuck'
+            
+            # Target became unstuck - need to exit camping
+            if not target_still_stuck:
+                logger.info(f"🏕️ Camping target '{self.camping_target_name}' is no longer stuck")
+                return 'unstuck'
+        
+        # Check for free centipede threats
+        for centipede in centipedes:
+            name = centipede['name']
+            body = centipede['body']
+            
+            # Skip stuck centipedes - they're not threats
+            if name in self.stuck_centipedes:
+                continue
+            
+            if not body:
+                continue
+            
+            # Get head position (last element)
+            head = Position(*body[-1])
+            
+            # Threat 1: Free centipede in same or adjacent column and within 5 rows
+            column_distance = abs(head.x - my_pos.x)
+            row_distance = my_pos.y - head.y  # Positive if centipede is above us
+            
+            if column_distance <= 1 and 0 < row_distance <= 5:
+                logger.warning(f"🏕️ CAMPING THREAT: Free centipede '{name}' at column distance {column_distance}, {row_distance} rows above")
+                return 'threat'
+            
+            # Threat 2: Free centipede within 3 rows (any column) and potentially descending
+            if 0 < row_distance <= 3:
+                # Check if it's moving toward us (descending or same row)
+                direction = centipede.get('direction', 1)  # 0=N, 1=E, 2=S, 3=W
+                
+                # If centipede is close horizontally, it's a threat
+                if column_distance <= 3:
+                    logger.warning(f"🏕️ CAMPING THREAT: Free centipede '{name}' very close - {row_distance} rows, {column_distance} cols")
+                    return 'threat'
+            
+            # Threat 3: Any free centipede on same row or below us
+            if row_distance <= 0 and column_distance <= 4:
+                logger.warning(f"🏕️ CAMPING THREAT: Free centipede '{name}' at same level or below, column distance {column_distance}")
+                return 'threat'
+        
+        # No threats detected
+        return None
+    
+    def should_enter_camping(self, target_name: str, is_aligned: bool, is_stuck: bool) -> bool:
+        """
+        Determine if agent should enter camping mode.
+        
+        Mid game: Only camp if aligned, no threats, clearly safe
+        Late game: Auto-enter when aligned with stuck target
+        
+        Args:
+            target_name: Name of the target centipede
+            is_aligned: True if agent is horizontally aligned with target
+            is_stuck: True if target is a stuck centipede
+        
+        Returns:
+            True if should enter camping mode
+        """
+        if not is_stuck or not is_aligned:
+            return False
+        
+        # Check for any threats
+        threat = self.check_camping_threats()
+        if threat:
+            return False
+        
+        # Late game: Always camp against stuck targets when aligned and safe
+        if self.late_game:
+            return True
+        
+        # Mid game: More conservative - only camp if clearly safe
+        bug_blaster = self.game_state.get('bug_blaster', {})
+        if not bug_blaster or 'pos' not in bug_blaster:
+            return False
+        
+        my_pos = Position(*bug_blaster['pos'])
+        centipedes = self.game_state.get('centipedes', [])
+        
+        # Check if there are any free centipedes nearby
+        for centipede in centipedes:
+            if centipede['name'] in self.stuck_centipedes:
+                continue
+            
+            if not centipede['body']:
+                continue
+            
+            head = Position(*centipede['body'][-1])
+            distance = my_pos.manhattan_distance(head)
+            
+            # In mid game, don't camp if any free centipede within 8 units
+            if distance < 8:
+                logger.debug(f"Mid game: not camping - free centipede '{centipede['name']}' at distance {distance}")
+                return False
+        
+        # Safe to camp in mid game
+        return True
+    
+    def decide_camping_action(self) -> Optional[str]:
+        """
+        Camping mode behavior for targeting stuck centipedes.
+        
+        Behavior:
+        - Stay stationary
+        - Shoot continuously when cooldown allows and line is clear
+        - Maintain defensive awareness for threats
+        - Exit camping if threats detected or target unstuck
+        
+        Returns:
+            - Action string if camping should continue
+            - None if camping should exit
+        """
+        bug_blaster = self.game_state.get('bug_blaster', {})
+        if not bug_blaster or 'pos' not in bug_blaster:
+            self.camping_mode = False
+            return None
+        
+        my_pos = Position(*bug_blaster['pos'])
+        
+        # Check for threats that should break camping
+        threat = self.check_camping_threats()
+        if threat:
+            if threat == 'threat':
+                logger.info(f"🏕️ EXITING CAMPING - threat detected, evading")
+                self.camping_mode = False
+                self.camping_target_name = None
+                # Return evasive action
+                return self.find_safe_move()
+            elif threat == 'unstuck':
+                logger.info(f"🏕️ EXITING CAMPING - target no longer stuck")
+                self.camping_mode = False
+                self.camping_target_name = None
+                return None  # Let normal logic take over
+        
+        # Validate camping target still exists
+        centipedes = self.game_state.get('centipedes', [])
+        target_centipede = None
+        for centipede in centipedes:
+            if centipede['name'] == self.camping_target_name:
+                target_centipede = centipede
+                break
+        
+        if not target_centipede or not target_centipede['body']:
+            logger.info(f"🏕️ EXITING CAMPING - target '{self.camping_target_name}' no longer exists")
+            self.camping_mode = False
+            self.camping_target_name = None
+            return None
+        
+        target_head = Position(*target_centipede['body'][-1])
+        mushrooms = self.get_mushroom_positions()
+        
+        # Check if still aligned
+        if my_pos.x != target_head.x:
+            logger.info(f"🏕️ EXITING CAMPING - no longer aligned (my_x={my_pos.x}, target_x={target_head.x})")
+            self.camping_mode = False
+            self.camping_target_name = None
+            return None
+        
+        # Check line of fire
+        mushrooms_in_path = 0
+        for y in range(target_head.y + 1, my_pos.y):
+            if (my_pos.x, y) in mushrooms:
+                mushrooms_in_path += 1
+        
+        line_clear = (mushrooms_in_path == 0)
+        
+        # Shoot if possible
+        if self.shot_cooldown == 0:
+            if line_clear:
+                # Direct shot at target
+                if self.is_safe_to_shoot():
+                    logger.info(f"🏕️ CAMPING: shooting stuck target '{self.camping_target_name}'")
+                    self.shot_cooldown = 10
+                    return 'A'
+            elif mushrooms_in_path <= 3:
+                # Clear mushrooms blocking path
+                if self.is_safe_to_shoot():
+                    logger.info(f"🏕️ CAMPING: clearing {mushrooms_in_path} mushroom(s) to reach '{self.camping_target_name}'")
+                    self.shot_cooldown = 10
+                    return 'A'
+            else:
+                # Too many mushrooms - need to reposition
+                logger.info(f"🏕️ EXITING CAMPING - {mushrooms_in_path} mushrooms blocking, need reposition")
+                self.camping_mode = False
+                self.camping_target_name = None
+                return None
+        
+        # Stay still while waiting for cooldown
+        # Return empty string to indicate "do nothing" (stay in place)
+        self.debug_info['reason'] = 'camping_waiting'
+        return ''
+
     def decide_focus_hunt_action(self) -> Optional[str]:
         """
         Late game focused hunting behavior
@@ -1309,6 +1581,23 @@ class CentipedeAgent:
         
         # Check if aligned with focus target
         if my_pos.x == focus_head.x and focus_head.y < my_pos.y:
+            is_stuck_target = self.focus_target_name in self.stuck_centipedes
+            
+            # CAMPING MODE ENTRY POINT
+            # If aligned with stuck target, consider entering camping mode
+            if is_stuck_target and self.should_enter_camping(self.focus_target_name, True, True):
+                if not self.camping_mode:
+                    logger.info(f"🏕️ ENTERING CAMPING MODE against stuck '{self.focus_target_name}' at column {focus_head.x}")
+                    self.camping_mode = True
+                    self.camping_target_name = self.focus_target_name
+                    self.camping_start_frame = self.frame_count
+                
+                # Let camping mode handle the action
+                action = self.decide_camping_action()
+                if action is not None:
+                    return action
+                # If camping exited, continue with normal logic below
+            
             # Check if line is clear and count mushrooms
             mushrooms_in_path = 0
             for y in range(focus_head.y + 1, my_pos.y):
@@ -1328,7 +1617,6 @@ class CentipedeAgent:
             # If target is a stuck centipede and mushrooms block the path,
             # allow clearing shots to open the line (max 3 mushrooms)
             if not line_clear:
-                is_stuck_target = self.focus_target_name in self.stuck_centipedes
                 if is_stuck_target and mushrooms_in_path <= 3 and self.shot_cooldown == 0:
                     # Targeting stuck centipede with blocked path - clear mushrooms
                     if self.is_safe_to_shoot():
@@ -1405,7 +1693,21 @@ class CentipedeAgent:
         if action := self.emergency_evade():
             self.debug_info['reason'] = 'emergency_evade'
             logger.info(f"Emergency evade: {action}")
+            # Exit camping mode on emergency
+            if self.camping_mode:
+                logger.info("🏕️ EXITING CAMPING - emergency evade triggered")
+                self.camping_mode = False
+                self.camping_target_name = None
             return action
+        
+        # 3.3 CAMPING MODE - Stay stationary and shoot stuck centipedes
+        # This has high priority to prevent unnecessary movement when camping
+        if self.camping_mode:
+            action = self.decide_camping_action()
+            if action is not None:
+                self.debug_info['reason'] = 'camping_mode'
+                return action
+            # If camping returned None, it exited - continue to normal logic
         
         # 3.5 ADADADA LOOP BREAKER - High priority when oscillating with stuck centipede target
         # If we're stuck in horizontal oscillation AND targeting a stuck centipede,
@@ -1507,6 +1809,25 @@ class CentipedeAgent:
                 
                 # Calculate horizontal distance to target
                 distance_x = abs(my_pos.x - target_x)
+                
+                # MID-GAME CAMPING MODE CHECK
+                # If aligned with stuck centipede and safe, enter camping
+                is_stuck_target = target_name in self.stuck_centipedes
+                is_aligned = (distance_x == 0)
+                
+                if is_aligned and is_stuck_target and not self.late_game:
+                    if self.should_enter_camping(target_name, True, True):
+                        if not self.camping_mode:
+                            logger.info(f"🏕️ MID-GAME: ENTERING CAMPING MODE against stuck '{target_name}'")
+                            self.camping_mode = True
+                            self.camping_target_name = target_name
+                            self.camping_start_frame = self.frame_count
+                        
+                        action = self.decide_camping_action()
+                        if action is not None:
+                            self.debug_info['reason'] = 'midgame_camping'
+                            return action
+                        # If camping exited, continue with normal logic
                 
                 # Improved shooting vs aligning decision
                 # ==========================================                
