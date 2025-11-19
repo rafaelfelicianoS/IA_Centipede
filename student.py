@@ -5,16 +5,7 @@ import os
 from collections import defaultdict, deque
 from typing import List, Tuple, Optional, Set
 import math
-import logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('agent_debug.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger('CentipedeAgent')
+
 DIRECTIONS = {
     'w': (0, -1),
     's': (0, 1),
@@ -22,6 +13,7 @@ DIRECTIONS = {
     'd': (1, 0),
 }
 LATE_GAME_MUSHROOM_THRESHOLD = 140
+# Representa uma posição (x,y) no grid. Helpers básicos.
 class Position:
     def __init__(self, x: int, y: int):
         self.x = x
@@ -38,6 +30,7 @@ class Position:
         return abs(self.x - other.x) + abs(self.y - other.y)
     def distance(self, other):
         return math.sqrt((self.x - other.x)**2 + (self.y - other.y)**2)
+# Agente principal: guarda estado, avalia estratégias e decide ações.
 class CentipedeAgent:
     def __init__(self):
         self.game_state = None
@@ -59,6 +52,7 @@ class CentipedeAgent:
         self.safe_zone_start = None
         self.frame_count = 0
         self.debug_info = {}
+    # Atualiza estado do jogo e caches (tamanho mapa, cooldowns, perigos, estratégia)
     def update_state(self, state: dict):
         self.game_state = state
         self.frame_count += 1
@@ -69,11 +63,11 @@ class CentipedeAgent:
         was_late_game = self.late_game
         self.late_game = mushroom_count >= LATE_GAME_MUSHROOM_THRESHOLD
         if self.late_game and not was_late_game:
-            logger.info(f"🎯 ENTERING LATE GAME MODE - {mushroom_count} mushrooms (threshold: {LATE_GAME_MUSHROOM_THRESHOLD})")
+            pass
         elif not self.late_game and was_late_game:
-            logger.info(f"✓ Exiting late game mode - {mushroom_count} mushrooms")
+            pass
             if self.camping_mode:
-                logger.info("🏕️ Exiting camping mode (late game ended)")
+                pass
                 self.camping_mode = False
                 self.camping_target_name = None
         if self.shot_cooldown > 0:
@@ -81,6 +75,7 @@ class CentipedeAgent:
         self.update_centipede_predictions()
         self.update_danger_zones()
         self.evaluate_strategy()
+    # Prediz movimentos das centipedes (até 5 passos) para evitar/antecipar colisões
     def update_centipede_predictions(self):
         self.predicted_positions = {}
         centipedes = self.game_state.get('centipedes', [])
@@ -124,6 +119,7 @@ class CentipedeAgent:
                 sim_head = next_pos
                 predictions.append(tuple(sim_head))
             self.predicted_positions[name] = predictions
+    # Marca centipedes como "presas" se quase não mexem nas últimas frames
     def detect_stuck_centipedes(self) -> List[str]:
         stuck = []
         for name, history in self.centipede_position_history.items():
@@ -133,13 +129,14 @@ class CentipedeAgent:
                 if len(unique_positions) <= 2:
                     stuck.append(name)
                     if name not in self.stuck_centipedes:
-                        logger.warning(f"Centipede {name} detected as STUCK at position {recent_positions[-1]}")
+                        pass
                         self.stuck_centipedes.add(name)
                 else:
                     if name in self.stuck_centipedes:
-                        logger.info(f"Centipede {name} is now moving again")
+                        pass
                         self.stuck_centipedes.discard(name)
         return stuck
+    # Detecta se nós próprios estamos num ciclo horizontal chato (ADAD...) e sem progresso
     def detect_self_stuck(self) -> bool:
         if self.camping_mode:
             return False
@@ -167,7 +164,7 @@ class CentipedeAgent:
                 pattern_detected = True
                 if self.self_stuck_cooldown == 0:
                     if not self.self_stuck_detected:
-                        logger.warning(f"⚠️ SELF-STUCK DETECTED: Alternating between columns {col_a} and {col_b} ({alternations} changes in 20 frames)")
+                        pass
                     self.self_stuck_detected = True
                     self.self_stuck_cooldown = 30  # Check again in 30 frames
         if not pattern_detected and len(unique_columns) <= 3:
@@ -177,7 +174,6 @@ class CentipedeAgent:
                 if self.self_stuck_cooldown == 0:
                     if not self.self_stuck_detected:
                         col_range = max(unique_columns) - min(unique_columns) if len(unique_columns) > 1 else 0
-                        logger.warning(f"⚠️ SELF-STUCK DETECTED: Confined to {len(unique_columns)} columns (range: {col_range}) with {num_stuck}/{len(centipedes)} stuck centipedes")
                     self.self_stuck_detected = True
                     self.self_stuck_cooldown = 30
         all_stuck = len(centipedes) > 0 and all(c['name'] in self.stuck_centipedes for c in centipedes)
@@ -206,15 +202,16 @@ class CentipedeAgent:
                     pattern_detected = True
                     if self.self_stuck_cooldown == 0:
                         if not self.self_stuck_detected:
-                            logger.warning(f"⚠️ SELF-STUCK DETECTED: All {len(centipedes)} centipedes stuck but blaster not aligned with any for {frames_far_from_all} frames")
+                            pass
                         self.self_stuck_detected = True
                         self.self_stuck_cooldown = 30
         if self.self_stuck_cooldown > 0:
             self.self_stuck_cooldown -= 1
         if not pattern_detected and self.self_stuck_detected:
-            logger.info("✓ Self-stuck condition cleared (patterns no longer present)")
+            pass
             self.self_stuck_detected = False
         return self.self_stuck_detected
+    # Calcula zonas perigosas com base no corpo das centipedes e previsões imediatas
     def update_danger_zones(self):
         self.danger_zones = set()
         centipedes = self.game_state.get('centipedes', [])
@@ -236,6 +233,7 @@ class CentipedeAgent:
                     adj = (pred[0] + dx, pred[1] + dy)
                     if 0 <= adj[0] < self.map_size[0] and 0 <= adj[1] < self.map_size[1]:
                         self.danger_zones.add(adj)
+    # Verifica se uma posição será ocupada pela cabeça de alguma centipede em breve
     def will_be_hit_soon(self, pos: Position, horizon: int = 2) -> bool:
         pos_tuple = pos.to_tuple()
         for name, predictions in self.predicted_positions.items():
@@ -244,7 +242,7 @@ class CentipedeAgent:
             for step_idx in range(min(horizon, len(predictions))):
                 predicted_head = predictions[step_idx]
                 if predicted_head == pos_tuple:
-                    logger.debug(f"⚠️ PREDICTED DEATH: Centipede '{name}' head will be at {pos_tuple} in step {step_idx + 1}")
+                    pass
                     return True
         centipedes = self.game_state.get('centipedes', [])
         for centipede in centipedes:
@@ -254,9 +252,10 @@ class CentipedeAgent:
             if body:
                 current_head = tuple(body[-1])  # Head is last element
                 if current_head == pos_tuple:
-                    logger.debug(f"⚠️ IMMEDIATE DEATH: Centipede head currently at {pos_tuple}")
+                    pass
                     return True
         return False
+    # Entre ações candidatas, escolhe a mais segura (considerando previsões e distâncias)
     def get_safest_action_with_prediction(self, candidate_actions: list, my_pos: Position) -> Optional[str]:
         mushrooms = self.get_mushroom_positions()
         centipedes = self.game_state.get('centipedes', [])
@@ -302,9 +301,9 @@ class CentipedeAgent:
             return safe_actions[0][0]
         if risky_actions:
             risky_actions.sort(key=lambda x: x[1], reverse=True)
-            logger.warning(f"⚠️ No safe actions available, choosing least risky: {risky_actions[0][0]}")
             return risky_actions[0][0]
         return None
+    # Escolhe estratégia (aggressive/defensive/clearing) conforme ameaças e cogumelos
     def evaluate_strategy(self):
         bug_blaster = self.game_state.get('bug_blaster', {})
         if not bug_blaster or 'pos' not in bug_blaster:
@@ -332,12 +331,12 @@ class CentipedeAgent:
             if in_safe_zone and closest_is_stuck:
                 self.current_strategy = "aggressive"
                 if old_strategy != "aggressive":
-                    logger.info(f"Staying AGGRESSIVE - in safe zone with stuck target '{closest_centipede_name}' (dist: {min_distance})")
+                    pass
                 return
             elif min_distance >= 3:
                 self.current_strategy = "aggressive"
                 if old_strategy != "aggressive":
-                    logger.info(f"Switching to AGGRESSIVE strategy - {len(stuck_centipedes)} stuck centipede(s), distance safe ({min_distance})")
+                    pass
                 return
             else:
                 pass  # Fall through to defensive check below
@@ -367,23 +366,24 @@ class CentipedeAgent:
             if all_close_threats_stuck and stuck_centipedes:
                 self.current_strategy = "aggressive"
                 if old_strategy != "aggressive":
-                    logger.info(f"Staying AGGRESSIVE - all close threats ({min_distance}) are stuck centipedes")
+                    pass
                 return
             self.current_strategy = "defensive"
             if old_strategy != "defensive":
-                logger.info(f"Switching to DEFENSIVE strategy - centipede at distance {min_distance:.1f}")
+                pass
             return
         if mushroom_count > 150 and not self.late_game:
             self.current_strategy = "clearing"
             if old_strategy != "clearing":
-                logger.info(f"Switching to CLEARING strategy - {mushroom_count} mushrooms (no stuck centipedes)")
+                pass
             return
         self.current_strategy = "aggressive"
         if old_strategy != "aggressive":
             if self.late_game:
-                logger.info("Switching to AGGRESSIVE strategy (late game mode)")
+                pass
             else:
-                logger.info("Switching to AGGRESSIVE strategy")
+                pass
+    # Scora segmentos e escolhe melhor alvo (bónus para stuck, alinhamento, caminho limpo)
     def find_best_target(self) -> Optional[Tuple[str, Tuple[int, int], float]]:
         bug_blaster = self.game_state.get('bug_blaster', {})
         if not bug_blaster or 'pos' not in bug_blaster:
@@ -407,7 +407,6 @@ class CentipedeAgent:
                     score += 200
                     if self.late_game:
                         score += 300
-                        logger.debug(f"Late game stuck bonus: +300 for '{name}'")
                 distance = abs(seg_pos.x - my_pos.x) + abs(seg_pos.y - my_pos.y)
                 score -= distance * 2  # Penalty: -2 per distance unit
                 if self.late_game:
@@ -426,7 +425,6 @@ class CentipedeAgent:
                         score += 150
                 if self_stuck and is_current_target:
                     score -= 100
-                    logger.debug(f"Self-stuck mitigation: reducing score for current target '{name}' by -100")
                 if distance < 3:
                     score -= 100
                 predictions = self.predicted_positions.get(name, [])
@@ -442,16 +440,16 @@ class CentipedeAgent:
             if self.last_target_name:
                 old_score = next((s for n, p, s in targets if n == self.last_target_name), None)
                 if old_score is not None:
-                    logger.info(f"🎯 Target changed: '{self.last_target_name}' (score: {old_score:.1f}) → '{best_name}' (score: {best_score:.1f}) at {best_pos}")
+                    pass
                 else:
-                    logger.info(f"🎯 New target: '{best_name}' (score: {best_score:.1f}) at {best_pos}")
+                    pass
             else:
-                logger.info(f"🎯 Initial target: '{best_name}' (score: {best_score:.1f}) at {best_pos}")
+                pass
             self.last_target_name = best_name
         if best_name in self.stuck_centipedes:
             distance = abs(best_pos[0] - my_pos.x) + abs(best_pos[1] - my_pos.y)
-            logger.debug(f"Targeting STUCK centipede '{best_name}' at {best_pos}, distance: {distance}, score: {best_score:.1f}")
         return best_target
+    # Procura movimento mais seguro ponderando distância a inimigos, perigos e objetivo
     def find_safe_move(self, preferred_direction: Optional[str] = None, returning_to_safe_zone: bool = False) -> str:
         bug_blaster = self.game_state.get('bug_blaster', {})
         if not bug_blaster or 'pos' not in bug_blaster:
@@ -492,7 +490,6 @@ class CentipedeAgent:
                             on_path_to_target = True
                     if on_path_to_target:
                         score += base_penalty * 0.6  # -300 instead of -500
-                        logger.debug(f"Self-stuck mitigation: reduced mushroom penalty for {action} (on path to stuck target)")
                     else:
                         score += base_penalty
                 else:
@@ -507,16 +504,13 @@ class CentipedeAgent:
                             break
                     if immediate_collision:
                         score -= 1000  # Lethal, avoid completely
-                        logger.debug(f"Returning to safe zone: 's' would collide with centipede, blocked")
                         continue
                     else:
                         score -= 50
-                        logger.debug(f"Returning to safe zone: 's' enters danger zone but not lethal")
                 else:
                     score -= 300
             if self.will_be_hit_soon(new_pos, horizon=2):
                 score -= 5000  # Massive penalty - almost always avoid
-                logger.debug(f"⚠️ Predicted death penalty for action '{action}' to {new_pos.to_tuple()}")
             min_centipede_dist = float('inf')
             for centipede in centipedes:
                 for segment in centipede['body']:
@@ -528,7 +522,6 @@ class CentipedeAgent:
                     score += min_centipede_dist * 5  # Reduced from *20
                 else:
                     score += 20  # Small bonus, but don't let distance dominate
-                logger.debug(f"Returning to safe zone: 's' distance scoring reduced (dist={min_centipede_dist})")
             else:
                 score += min_centipede_dist * 20
             if new_pos.y >= self.safe_zone_start:
@@ -536,13 +529,11 @@ class CentipedeAgent:
             if returning_to_safe_zone and action == 's':
                 if new_pos.y > my_pos.y or new_pos.y >= self.safe_zone_start:
                     score += 500  # Dominant bonus to override distance penalties
-                    logger.debug(f"Returning to safe zone: MASSIVE bonus for 's' (moving from y={my_pos.y} to y={new_pos.y})")
             if preferred_direction and action == preferred_direction:
                 score += 100
             if self.self_stuck_detected and action in ['w', 's']:
                 if new_pos.to_tuple() not in self.danger_zones:
                     score += 80
-                    logger.debug(f"Self-stuck mitigation: vertical movement bonus for {action}")
             if self.self_stuck_detected and targeting_stuck and target_stuck_pos:
                 current_dist = my_pos.manhattan_distance(target_stuck_pos)
                 new_dist = new_pos.manhattan_distance(target_stuck_pos)
@@ -552,6 +543,7 @@ class CentipedeAgent:
                 best_score = score
                 best_action = action
         return best_action
+    # Se estamos na última linha com ameaça lateral, tenta subir ou fugir lateralmente
     def evade_bottom_row_snake(self) -> Optional[str]:
         bug_blaster = self.game_state.get('bug_blaster', {})
         if not bug_blaster or 'pos' not in bug_blaster:
@@ -578,10 +570,10 @@ class CentipedeAgent:
         if not up_blocked:
             if not self.will_be_hit_soon(up_pos, horizon=2):
                 if sandwiched or up_pos.to_tuple() not in self.danger_zones:
-                    logger.debug(f"Bottom row escape: going UP (prediction-safe)")
+                    pass
                     return 'w'
             else:
-                logger.debug(f"⚠️ Bottom row: UP blocked by predicted death at {up_pos.to_tuple()}")
+                pass
         if threats:
             closest_threat = min(threats, key=lambda x: abs(x - my_pos.x))
             if closest_threat < my_pos.x:
@@ -590,13 +582,14 @@ class CentipedeAgent:
                 candidate_actions = ['a', 'd', 'w', '']
             safest = self.get_safest_action_with_prediction(candidate_actions, my_pos)
             if safest:
-                logger.debug(f"Bottom row escape: prediction-filtered choice '{safest}'")
+                pass
                 return safest
             if closest_threat < my_pos.x:
                 return self.find_safe_move('d')
             else:
                 return self.find_safe_move('a')
         return None
+    # Presos entre cogumelos nas laterais? tenta subir/descer ou disparar se possível
     def detect_horizontal_trap(self) -> Optional[str]:
         bug_blaster = self.game_state.get('bug_blaster', {})
         if not bug_blaster or 'pos' not in bug_blaster:
@@ -621,6 +614,7 @@ class CentipedeAgent:
             if self.shot_cooldown == 0:
                 return 'A'
         return None
+    # Tiro seguro: evita trocar de lugar com a cabeça da centipede na próxima frame
     def is_safe_to_shoot(self) -> bool:
         bug_blaster = self.game_state.get('bug_blaster', {})
         if not bug_blaster or 'pos' not in bug_blaster:
@@ -665,9 +659,10 @@ class CentipedeAgent:
                         return False
                     safe_position = Position(safe_pos[0], safe_pos[1])
                     if self.will_be_hit_soon(safe_position, horizon=2):
-                        logger.debug(f"⚠️ Shoot unsafe: escape position {safe_pos} will be hit soon")
+                        pass
                         return False
         return True
+    # Evasão de emergência quando há ameaça imediata (prioridade máxima)
     def emergency_evade(self) -> Optional[str]:
         bug_blaster = self.game_state.get('bug_blaster', {})
         if not bug_blaster or 'pos' not in bug_blaster:
@@ -685,7 +680,6 @@ class CentipedeAgent:
                 break
         if not immediate_threat:
             return None
-        logger.warning(f"EMERGENCY! Centipede adjacent to position {my_pos.to_tuple()}")
         candidate_actions = ['w', 'a', 's', 'd', '']
         for centipede in centipedes:
             if not centipede['body']:
@@ -695,16 +689,15 @@ class CentipedeAgent:
             if head_x == my_pos.x and head_y == my_pos.y - 1:
                 if 'w' in candidate_actions:
                     candidate_actions.remove('w')
-                    logger.debug(f"Emergency: Excluded 'w' - head immediately above at ({head_x}, {head_y})")
             if head_x == my_pos.x and head_y == my_pos.y + 1:
                 if 's' in candidate_actions:
                     candidate_actions.remove('s')
-                    logger.debug(f"Emergency: Excluded 's' - head immediately below at ({head_x}, {head_y})")
         safest = self.get_safest_action_with_prediction(candidate_actions, my_pos)
         if safest:
-            logger.info(f"Emergency evade: prediction-filtered choice '{safest}'")
+            pass
             return safest
         return self.find_safe_move()
+    # No modo camping, sai se houver ameaça real ou se o alvo deixou de estar preso
     def check_camping_threats(self) -> Optional[str]:
         bug_blaster = self.game_state.get('bug_blaster', {})
         if not bug_blaster or 'pos' not in bug_blaster:
@@ -721,10 +714,10 @@ class CentipedeAgent:
                         target_still_stuck = True
                     break
             if not target_exists:
-                logger.info(f"🏕️ Camping target '{self.camping_target_name}' died")
+                pass
                 return 'unstuck'
             if not target_still_stuck:
-                logger.info(f"🏕️ Camping target '{self.camping_target_name}' is no longer stuck")
+                pass
                 return 'unstuck'
         for centipede in centipedes:
             name = centipede['name']
@@ -737,17 +730,18 @@ class CentipedeAgent:
             column_distance = abs(head.x - my_pos.x)
             row_distance = my_pos.y - head.y  # Positive if centipede is above us
             if column_distance <= 1 and 0 < row_distance <= 5:
-                logger.warning(f"🏕️ CAMPING THREAT: Free centipede '{name}' at column distance {column_distance}, {row_distance} rows above")
+                pass
                 return 'threat'
             if 0 < row_distance <= 3:
                 direction = centipede.get('direction', 1)  # 0=N, 1=E, 2=S, 3=W
                 if column_distance <= 3:
-                    logger.warning(f"🏕️ CAMPING THREAT: Free centipede '{name}' very close - {row_distance} rows, {column_distance} cols")
+                    pass
                     return 'threat'
             if row_distance <= 0 and column_distance <= 4:
-                logger.warning(f"🏕️ CAMPING THREAT: Free centipede '{name}' at same level or below, column distance {column_distance}")
+                pass
                 return 'threat'
         return None
+    # Entra em camping apenas se alvo estiver preso + alinhamento + sem ameaças próximas
     def should_enter_camping(self, target_name: str, is_aligned: bool, is_stuck: bool) -> bool:
         if not is_stuck or not is_aligned:
             return False
@@ -769,9 +763,10 @@ class CentipedeAgent:
             head = Position(*centipede['body'][-1])
             distance = my_pos.manhattan_distance(head)
             if distance < 8:
-                logger.debug(f"Mid game: not camping - free centipede '{centipede['name']}' at distance {distance}")
+                pass
                 return False
         return True
+    # No camping, mantém coluna e dispara quando seguro; sai só por ameaça/unstuck
     def decide_camping_action(self) -> Optional[str]:
         bug_blaster = self.game_state.get('bug_blaster', {})
         if not bug_blaster or 'pos' not in bug_blaster:
@@ -781,12 +776,12 @@ class CentipedeAgent:
         threat = self.check_camping_threats()
         if threat:
             if threat == 'threat':
-                logger.info(f"🏕️ EXITING CAMPING - threat detected, evading")
+                pass
                 self.camping_mode = False
                 self.camping_target_name = None
                 return self.find_safe_move()
             elif threat == 'unstuck':
-                logger.info(f"🏕️ EXITING CAMPING - target no longer stuck")
+                pass
                 self.camping_mode = False
                 self.camping_target_name = None
                 return None  # Let normal logic take over
@@ -797,14 +792,14 @@ class CentipedeAgent:
                 target_centipede = centipede
                 break
         if not target_centipede or not target_centipede['body']:
-            logger.info(f"🏕️ EXITING CAMPING - target '{self.camping_target_name}' no longer exists")
+            pass
             self.camping_mode = False
             self.camping_target_name = None
             return None
         target_head = Position(*target_centipede['body'][-1])
         mushrooms = self.get_mushroom_positions()
         if my_pos.x != target_head.x:
-            logger.info(f"🏕️ EXITING CAMPING - no longer aligned (my_x={my_pos.x}, target_x={target_head.x})")
+            pass
             self.camping_mode = False
             self.camping_target_name = None
             return None
@@ -812,17 +807,18 @@ class CentipedeAgent:
         for y in range(target_head.y + 1, my_pos.y):
             if (my_pos.x, y) in mushrooms:
                 mushrooms_in_path += 1
-        line_clear = (mushrooms_in_path == 0)
+        is_stuck = self.camping_target_name in self.stuck_centipedes
         if self.shot_cooldown == 0:
             if self.is_safe_to_shoot():
-                if line_clear:
-                    logger.info(f"🏕️ CAMPING: shooting stuck target '{self.camping_target_name}'")
-                else:
-                    logger.info(f"🏕️ CAMPING: clearing {mushrooms_in_path} mushroom(s) to reach stuck target '{self.camping_target_name}'")
+                if not is_stuck and mushrooms_in_path > 3:
+                    self.camping_mode = False
+                    self.camping_target_name = None
+                    return None
                 self.shot_cooldown = 10
                 return 'A'
         self.debug_info['reason'] = 'camping_waiting'
         return ''
+    # Loop principal de decisão: evasão > traps > emergência > camping > estratégia normal
     def decide_action(self) -> str:
         bug_blaster = self.game_state.get('bug_blaster', {})
         if not bug_blaster or 'pos' not in bug_blaster:
@@ -830,17 +826,14 @@ class CentipedeAgent:
         my_pos = Position(*bug_blaster['pos'])
         if action := self.evade_bottom_row_snake():
             self.debug_info['reason'] = 'bottom_row_escape'
-            logger.info(f"Bottom-row escape: {action}")
             return action
         if action := self.detect_horizontal_trap():
             self.debug_info['reason'] = 'horizontal_trap'
-            logger.info(f"Horizontal trap escape: {action}")
             return action
         if action := self.emergency_evade():
             self.debug_info['reason'] = 'emergency_evade'
-            logger.info(f"Emergency evade: {action}")
             if self.camping_mode:
-                logger.info("🏕️ EXITING CAMPING - emergency evade triggered")
+                pass
                 self.camping_mode = False
                 self.camping_target_name = None
             return action
@@ -849,6 +842,7 @@ class CentipedeAgent:
             if action is not None:
                 self.debug_info['reason'] = 'camping_mode'
                 return action
+        # Late game + auto-stuck: se alvo também está preso e estamos quase alinhados, disparar
         if self.self_stuck_detected and self.late_game:
             centipedes = self.game_state.get('centipedes', [])
             target = self.find_best_target()
@@ -856,19 +850,11 @@ class CentipedeAgent:
                 target_name, target_pos, _ = target
                 target_x, target_y = target_pos
                 if target_name in self.stuck_centipedes:
-                    mushrooms = self.get_mushroom_positions()
-                    mushrooms_in_path = 0
-                    for y in range(target_y + 1, my_pos.y):
-                        if (my_pos.x, y) in mushrooms:
-                            mushrooms_in_path += 1
+                    # Dispara mesmo com muitos cogumelos: mantemos só o check de segurança
                     distance_x = abs(my_pos.x - target_x)
                     if distance_x <= 2 and self.shot_cooldown == 0 and self.is_safe_to_shoot():
                         self.debug_info['reason'] = 'adadada_loop_breaker'
                         self.shot_cooldown = 10
-                        if mushrooms_in_path > 0:
-                            logger.info(f"🎯 ADADADA LOOP BREAKER: shooting to clear {mushrooms_in_path} mushroom(s) blocking stuck target '{target_name}' (distance_x={distance_x})")
-                        else:
-                            logger.info(f"🎯 ADADADA LOOP BREAKER: direct shot at stuck target '{target_name}' (distance_x={distance_x})")
                         return 'A'
         if self.current_strategy == "defensive":
             self.debug_info['reason'] = 'defensive_mode'
@@ -880,7 +866,6 @@ class CentipedeAgent:
                     if self.is_safe_to_shoot():
                         self.debug_info['reason'] = 'defensive_safe_shot'
                         self.shot_cooldown = 10
-                        logger.debug(f"Defensive safe shot at {target_pos}")
                         return 'A'
                 else:
                     if target_y < my_pos.y - 2:
@@ -888,20 +873,16 @@ class CentipedeAgent:
                             self.debug_info['reason'] = 'defensive_align_right'
                             move = self.find_safe_move('d')
                             if move == 'd':  # Só move se for seguro
-                                logger.debug(f"Defensive align right towards {target_pos}")
                                 return move
                         elif my_pos.x > target_x:
                             self.debug_info['reason'] = 'defensive_align_left'
                             move = self.find_safe_move('a')
                             if move == 'a':  # Só move se for seguro
-                                logger.debug(f"Defensive align left towards {target_pos}")
                                 return move
             if my_pos.y < self.safe_zone_start:
                 action = self.find_safe_move('s')
-                logger.debug(f"Defensive: moving to safe zone")
             else:
                 action = self.find_safe_move()
-                logger.debug(f"Defensive: safe movement")
             return action
         if self.current_strategy == "aggressive":
             target = self.find_best_target()
@@ -912,9 +893,10 @@ class CentipedeAgent:
                 is_stuck_target = target_name in self.stuck_centipedes
                 is_aligned = (distance_x == 0)
                 if is_aligned and is_stuck_target:
+                    # Stuck + alinhado: tenta entrar/ficar em camping e limpar coluna
                     if self.should_enter_camping(target_name, True, True):
                         if not self.camping_mode:
-                            logger.info(f"🏕️ ENTERING CAMPING MODE against stuck '{target_name}'")
+                            pass
                             self.camping_mode = True
                             self.camping_target_name = target_name
                         action = self.decide_camping_action()
@@ -940,58 +922,51 @@ class CentipedeAgent:
                         self.debug_info['reason'] = 'shooting_target'
                         self.shot_cooldown = 10
                         if self.self_stuck_detected and distance_x > 0:
-                            logger.info(f"🎯 Shooting from reasonably aligned position (distance_x={distance_x}) - self-stuck mitigation")
-                        logger.debug(f"Aggressive shot at {target_pos}, score={target_score:.1f}")
+                            pass
                         return 'A'
                     elif self.self_stuck_detected and mushrooms_in_path == 1 and target_name in self.stuck_centipedes:
+                        # Quando estamos presos e só há 1 cogumelo, limpar rápido ajuda a destravar
                         centipedes = self.game_state.get('centipedes', [])
                         all_stuck = all(c['name'] in self.stuck_centipedes for c in centipedes)
                         if all_stuck and self.is_safe_to_shoot():
                             self.debug_info['reason'] = 'self_stuck_single_mushroom_clear'
                             self.shot_cooldown = 10
-                            logger.info(f"🎯 Self-stuck mitigation: shooting through single blocking mushroom (distance_x={distance_x})")
                             return 'A'
                     elif not self.late_game and my_pos.x == target_x:
+                        # Midgame: usa tiros utilitários para abrir coluna até ao alvo
                         self.debug_info['reason'] = 'clearing_shot_path'
                         self.shot_cooldown = 10
-                        logger.debug(f"Clearing mushroom in shot path to {target_pos}")
                         return 'A'
                     elif self.late_game and my_pos.x == target_x:
+                        # Late game: stuck dispara sempre; all_stuck + self_stuck também permite limpar
                         centipedes = self.game_state.get('centipedes', [])
                         all_stuck = all(c['name'] in self.stuck_centipedes for c in centipedes)
                         if target_name in self.stuck_centipedes:
                             if self.is_safe_to_shoot():
                                 self.debug_info['reason'] = 'late_game_clearing_for_stuck_target'
                                 self.shot_cooldown = 10
-                                logger.info(f"🎯 Late game: clearing {mushrooms_in_path} mushroom(s) to reach stuck centipede '{target_name}'")
                                 return 'A'
                         elif all_stuck and self.self_stuck_detected:
                             if self.is_safe_to_shoot():
                                 self.debug_info['reason'] = 'late_game_unstuck_clearing_shot'
                                 self.shot_cooldown = 10
-                                logger.info(f"🎯 Late game exception: clearing shot to unstuck (all stuck + self-stuck)")
                                 return 'A'
                 if my_pos.x < target_x:
                     self.debug_info['reason'] = 'aligning_right'
-                    logger.debug(f"Aligning right to target at x={target_x} (current distance: {distance_x})")
                     return self.find_safe_move('d')
                 elif my_pos.x > target_x:
                     self.debug_info['reason'] = 'aligning_left'
-                    logger.debug(f"Aligning left to target at x={target_x} (current distance: {distance_x})")
                     return self.find_safe_move('a')
         if self.current_strategy == "clearing":
             self.debug_info['reason'] = 'clearing_mode'
-            logger.debug("Clearing mode: shooting mushrooms")
             if self.shot_cooldown == 0:
                 self.shot_cooldown = 10
                 return 'A'
             return self.find_safe_move()
         if my_pos.y < self.safe_zone_start:
             self.debug_info['reason'] = 'return_to_safe_zone'
-            logger.info(f"🏠 Returning to safe zone from y={my_pos.y} to y>={self.safe_zone_start}")
             return self.find_safe_move('s', returning_to_safe_zone=True)
         self.debug_info['reason'] = 'fallback_safe'
-        logger.debug("Fallback: safe movement")
         return self.find_safe_move()
     def get_mushroom_positions(self) -> Set[Tuple[int, int]]:
         mushrooms = self.game_state.get('mushrooms', [])
@@ -1001,7 +976,6 @@ async def agent_loop(server_address="localhost:8000", agent_name="student"):
     agent = CentipedeAgent()
     async with websockets.connect(f"ws://{server_address}/player") as websocket:
         await websocket.send(json.dumps({"cmd": "join", "name": agent_name}))
-        logger.info(f"Agent {agent_name} joined the game")
         while True:
             try:
                 state = json.loads(await websocket.recv())
@@ -1010,30 +984,26 @@ async def agent_loop(server_address="localhost:8000", agent_name="student"):
                     score = state.get('score', 0)
                     num_centipedes = len(state.get('centipedes', []))
                     num_mushrooms = len(state.get('mushrooms', []))
-                    logger.info(f"Step: {agent.frame_count}, Score: {score}, "
-                              f"Strategy: {agent.current_strategy}, "
-                              f"Centipedes: {num_centipedes}, "
-                              f"Mushrooms: {num_mushrooms}")
+                    pass
                 try:
                     key = agent.decide_action()
                     agent.last_action = key
                     if agent.self_stuck_detected and key in ['w', 's']:
-                        logger.info(f"✓ Self-stuck cleared by vertical movement: {key}")
+                        pass
                         agent.self_stuck_detected = False
                 except Exception as action_error:
-                    logger.error(f"Error deciding action: {action_error}", exc_info=True)
+                    pass
                     key = agent.find_safe_move()
                     if not key:
                         key = ''
                 await websocket.send(json.dumps({"cmd": "key", "key": key}))
                 if agent.frame_count % 100 == 0 and agent.debug_info.get('reason'):
-                    logger.debug(f"Action: {key}, Reason: {agent.debug_info.get('reason')}, "
-                               f"Position: {agent.game_state.get('bug_blaster', {}).get('pos', 'unknown')}")
+                    pass
             except websockets.exceptions.ConnectionClosedOK:
-                logger.info("Server has cleanly disconnected us")
+                pass
                 return
             except Exception as e:
-                logger.error(f"Error in agent loop: {e}", exc_info=True)
+                pass
                 break
 if __name__ == "__main__":
     SERVER = os.environ.get("SERVER", "localhost")
@@ -1042,6 +1012,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(agent_loop(f"{SERVER}:{PORT}", NAME))
     except KeyboardInterrupt:
-        logger.info("Agent stopped by user")
+        pass
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        pass
