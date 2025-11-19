@@ -1350,29 +1350,21 @@ class CentipedeAgent:
                     else:
                         return self.find_safe_move('a')
         
-        # Not aligned - try to align horizontally with target
-        # But stay close to current row (don't chase too high)
-        if focus_head.y > my_pos.y - 3:  # Target is close vertically
-            if my_pos.x < focus_head.x:
-                logger.debug(f"Late game: aligning right towards focus target column {focus_head.x}")
-                return self.find_safe_move('d')
-            elif my_pos.x > focus_head.x:
-                logger.debug(f"Late game: aligning left towards focus target column {focus_head.x}")
-                return self.find_safe_move('a')
-        else:
-            # Target is too high, maintain position in safe zone
-            # Keep moving to stay mobile
-            if my_pos.x <= 5:
-                return self.find_safe_move('d')
-            elif my_pos.x >= self.map_size[0] - 6:
-                return self.find_safe_move('a')
-            else:
-                # Small patrol movement
-                if my_pos.x < self.map_size[0] // 2:
-                    return self.find_safe_move('d')
-                else:
-                    return self.find_safe_move('a')
+        # Not aligned - always align horizontally with focus target column
+        # regardless of how high the target is. Trust find_safe_move and danger zones
+        # for safety. The goal is to be ready to shoot when opportunity arises.
         
+        is_stuck_target = self.focus_target_name in self.stuck_centipedes
+        
+        if my_pos.x < focus_head.x:
+            logger.debug(f"Late game: aligning right towards focus target column {focus_head.x} (stuck={is_stuck_target})")
+            return self.find_safe_move('d')
+        elif my_pos.x > focus_head.x:
+            logger.debug(f"Late game: aligning left towards focus target column {focus_head.x} (stuck={is_stuck_target})")
+            return self.find_safe_move('a')
+        
+        # Already aligned but can't shoot (maybe waiting for cooldown or not safe)
+        # Stay in position - find_safe_move with no preference will keep us safe
         return self.find_safe_move()
     
     def decide_action(self) -> str:
@@ -1642,9 +1634,15 @@ class CentipedeAgent:
         """
         Update focus target for late game hunting
         Priority:
-        1. Stuck centipedes (longest one)
+        1. Stuck centipedes - scored by: length, Y position (lower is better), column distance
         2. Longest centipede overall
         3. Tie-break: closest to player, not too high, accessible column
+        
+        In late game, stuck centipedes are ALWAYS prioritized as they are easier targets.
+        Among stuck centipedes, prefer those that are:
+        - Lower in the map (higher Y coordinate) - easier to reach and kill
+        - Longer (more potential points)
+        - Closer to our current column (faster alignment)
         """
         centipedes = self.game_state.get('centipedes', [])
         if not centipedes:
@@ -1671,15 +1669,43 @@ class CentipedeAgent:
             else:
                 normal_centipedes.append((name, body, length))
         
-        # Priority 1: Choose longest stuck centipede
+        # Priority 1: Choose best stuck centipede
+        # In late game, stuck centipedes are the primary target
+        # Score by: length, Y position (lower is better), column distance (closer is better)
         if stuck_centipedes:
-            stuck_centipedes.sort(key=lambda x: x[2], reverse=True)  # Sort by length
-            best = stuck_centipedes[0]
-            old_target = self.focus_target_name
-            self.focus_target_name = best[0]
-            if old_target != best[0]:
-                logger.info(f"🎯 Late game focus: STUCK centipede '{best[0]}' (length: {best[2]})")
-            return
+            best_stuck = None
+            best_stuck_score = -float('inf')
+            
+            for name, body, length in stuck_centipedes:
+                if not body:
+                    continue
+                
+                head = Position(*body[-1])  # Head is last element
+                
+                # Length score: more segments = more points potential
+                length_score = length * 10
+                
+                # Y position score: lower in map (higher Y) = easier to kill
+                # This is critical - stuck centipedes high up are hard to reach
+                y_score = head.y * 5
+                
+                # Column distance: closer to our column = faster alignment
+                column_dist = abs(head.x - my_pos.x)
+                column_score = -column_dist * 3
+                
+                total_score = length_score + y_score + column_score
+                
+                if total_score > best_stuck_score:
+                    best_stuck_score = total_score
+                    best_stuck = (name, body, length)
+            
+            if best_stuck:
+                old_target = self.focus_target_name
+                self.focus_target_name = best_stuck[0]
+                if old_target != best_stuck[0]:
+                    head_y = best_stuck[1][-1][1] if best_stuck[1] else 0
+                    logger.info(f"🎯 Late game focus: STUCK centipede '{best_stuck[0]}' (length: {best_stuck[2]}, y: {head_y}, score: {best_stuck_score:.1f})")
+                return
         
         # Priority 2: Choose longest centipede overall
         all_centipedes = normal_centipedes
