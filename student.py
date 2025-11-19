@@ -57,6 +57,25 @@ The agent NEVER:
 ADADADA Loop Prevention:
 - When horizontal oscillation detected (alternating a/d), triggers shooting to clear path
 - Applies when targeting stuck centipedes with mushrooms blocking
+
+RETURN TO SAFE ZONE (v2):
+=========================
+When the agent is returning to the safe zone, a special priority system is used
+to eliminate wswsws oscillation patterns:
+
+Priority order: s > a/d > w
+1. 's' (down) - HIGHEST PRIORITY when safe
+   - Gets +500 bonus for descending toward safe zone
+   - Minimal distance penalty consideration
+2. 'a'/'d' (lateral) - SECONDARY PRIORITY
+   - Gets +200 bonus for repositioning
+   - Used to escape tight spots or reposition when 's' is blocked
+3. 'w' (up) - LAST RESORT ONLY
+   - Gets -100 penalty to discourage upward movement
+   - Only chosen when s, a, d are all dangerous or blocked
+
+Self-stuck vertical bonus is DISABLED in this mode to prevent 'w' from gaining
+artificial priority that causes wswsws patterns.
 """
 
 import asyncio
@@ -850,10 +869,13 @@ class CentipedeAgent:
         
         Args:
             preferred_direction: Optional direction hint ('w', 'a', 's', 'd')
-            returning_to_safe_zone: When True, heavily favor downward movement ('s')
-                                    even if it approaches centipedes, as long as it's
-                                    not immediately lethal. This overrides normal safety
-                                    scoring to enable returning to safe zone.
+            returning_to_safe_zone: When True, uses special priority system:
+                                    Priority: s > a/d > w
+                                    - 's' (down) is always preferred when safe
+                                    - 'a'/'d' (lateral) are secondary options
+                                    - 'w' (up) is last resort only
+                                    Self-stuck vertical bonus is disabled in this mode
+                                    to prevent wswsws oscillation patterns.
         """
         bug_blaster = self.game_state.get('bug_blaster', {})
         
@@ -925,10 +947,10 @@ class CentipedeAgent:
                 continue
             
             # Danger zone?
-            # EXCEPTION: When returning to safe zone, allow 's' to enter danger zones
-            # since we explicitly want to descend even near centipedes (but not collide)
+            # EXCEPTION: When returning to safe zone, allow 's' and 'a'/'d' to enter danger zones
+            # since we explicitly want to descend/reposition even near centipedes (but not collide)
             if new_pos.to_tuple() in self.danger_zones:
-                if returning_to_safe_zone and action == 's':
+                if returning_to_safe_zone and action in ['s', 'a', 'd']:
                     # Check for immediate collision only (not danger zone)
                     immediate_collision = False
                     for centipede in centipedes:
@@ -938,12 +960,12 @@ class CentipedeAgent:
                     
                     if immediate_collision:
                         score -= 1000  # Lethal, avoid completely
-                        logger.debug(f"Returning to safe zone: 's' would collide with centipede, blocked")
+                        logger.debug(f"Return to safe zone: '{action}' would collide with centipede, blocked")
                         continue
                     else:
                         # In danger zone but not immediate death - small penalty only
                         score -= 50
-                        logger.debug(f"Returning to safe zone: 's' enters danger zone but not lethal")
+                        logger.debug(f"Return to safe zone: '{action}' enters danger zone but not lethal")
                 else:
                     score -= 300
             
@@ -963,31 +985,47 @@ class CentipedeAgent:
                     dist = new_pos.manhattan_distance(seg_pos)
                     min_centipede_dist = min(min_centipede_dist, dist)
             
-            # When returning to safe zone, heavily reduce/ignore distance penalty for 's'
-            # This is the key fix: normal gameplay favors staying away from centipedes,
-            # but when explicitly returning to safe zone, we need to descend regardless
-            if returning_to_safe_zone and action == 's':
-                # Minimal distance consideration - only care about immediate threats
-                if min_centipede_dist < 2:
-                    score += min_centipede_dist * 5  # Reduced from *20
+            # RETURN TO SAFE ZONE: Special priority system
+            # Priority order: s > a/d > w
+            # This eliminates wswsws oscillation patterns
+            if returning_to_safe_zone:
+                if action == 's':
+                    # 's' (down) - HIGHEST PRIORITY when safe
+                    # Minimal distance consideration - only care about immediate threats
+                    if min_centipede_dist < 2:
+                        score += min_centipede_dist * 5
+                    else:
+                        score += 20  # Small base, don't let distance dominate
+                    
+                    # Massive bonus for descending toward safe zone
+                    if new_pos.y > my_pos.y or new_pos.y >= self.safe_zone_start:
+                        score += 500
+                        logger.debug(f"Return to safe zone: 's' gets priority bonus (y={my_pos.y} -> {new_pos.y})")
+                
+                elif action in ['a', 'd']:
+                    # 'a'/'d' (lateral) - SECONDARY PRIORITY
+                    # Used to escape tight spots or reposition when 's' is blocked
+                    score += min_centipede_dist * 15  # Moderate distance consideration
+                    score += 200  # Secondary priority bonus
+                    logger.debug(f"Return to safe zone: '{action}' gets secondary priority bonus")
+                
+                elif action == 'w':
+                    # 'w' (up) - LAST RESORT ONLY
+                    # Only use when s, a, d are all dangerous or blocked
+                    score += min_centipede_dist * 20  # Normal distance scoring
+                    score -= 100  # Penalty to make it last resort
+                    logger.debug(f"Return to safe zone: 'w' penalized as last resort")
+                
                 else:
-                    score += 20  # Small bonus, but don't let distance dominate
-                logger.debug(f"Returning to safe zone: 's' distance scoring reduced (dist={min_centipede_dist})")
+                    # Staying still - moderate priority
+                    score += min_centipede_dist * 10
             else:
+                # Normal gameplay - standard distance scoring
                 score += min_centipede_dist * 20
             
             # Stay in safe zone bonus
             if new_pos.y >= self.safe_zone_start:
                 score += 50
-            
-            # MASSIVE bonus for returning to safe zone via 's'
-            # When decide_action explicitly requests return to safe zone,
-            # we want 's' to win unless it's immediately lethal
-            if returning_to_safe_zone and action == 's':
-                # Check if we're actually moving toward safe zone
-                if new_pos.y > my_pos.y or new_pos.y >= self.safe_zone_start:
-                    score += 500  # Dominant bonus to override distance penalties
-                    logger.debug(f"Returning to safe zone: MASSIVE bonus for 's' (moving from y={my_pos.y} to y={new_pos.y})")
             
             # CENTERING DISABLED:
             # Antes: penalizávamos a distância ao centro do mapa para puxar o agente
@@ -1004,7 +1042,8 @@ class CentipedeAgent:
             
             # SELF-STUCK MITIGATION: Bonus for vertical movement
             # When stuck horizontally, vertical movement helps break the pattern
-            if self.self_stuck_detected and action in ['w', 's']:
+            # BUT: Disabled when returning to safe zone to prevent wswsws oscillation
+            if self.self_stuck_detected and action in ['w', 's'] and not returning_to_safe_zone:
                 # Only give bonus if vertical move is reasonably safe
                 if new_pos.to_tuple() not in self.danger_zones:
                     score += 80
