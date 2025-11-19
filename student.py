@@ -431,6 +431,11 @@ class CentipedeAgent:
             body = centipede['body']
             name = centipede['name']
             
+            # STUCK CENTIPEDE EXCEPTION: Skip stuck centipedes from danger zones
+            # They are not a threat and should not block our movements or shots
+            if name in self.stuck_centipedes:
+                continue
+            
             # Add zones around all body segments
             for segment in body:
                 self.danger_zones.add(tuple(segment))
@@ -470,6 +475,10 @@ class CentipedeAgent:
         
         # Check all centipede predictions
         for name, predictions in self.predicted_positions.items():
+            # STUCK CENTIPEDE EXCEPTION: Skip stuck centipedes from hit prediction
+            if name in self.stuck_centipedes:
+                continue
+            
             # Check up to horizon steps ahead
             for step_idx in range(min(horizon, len(predictions))):
                 predicted_head = predictions[step_idx]
@@ -480,6 +489,10 @@ class CentipedeAgent:
         # Also check current head positions (step 0)
         centipedes = self.game_state.get('centipedes', [])
         for centipede in centipedes:
+            # STUCK CENTIPEDE EXCEPTION: Skip stuck centipedes from current head check
+            if centipede['name'] in self.stuck_centipedes:
+                continue
+            
             body = centipede['body']
             if body:
                 current_head = tuple(body[-1])  # Head is last element
@@ -630,6 +643,11 @@ class CentipedeAgent:
         threat_below = False
         
         for centipede in centipedes:
+            # STUCK CENTIPEDE EXCEPTION: Skip stuck centipedes from threat evaluation
+            # They should not trigger defensive mode
+            if centipede['name'] in self.stuck_centipedes:
+                continue
+            
             for segment in centipede['body']:
 
 
@@ -1170,6 +1188,10 @@ class CentipedeAgent:
             body = centipede['body']
             direction = centipede['direction']  # 0=N, 1=E, 2=S, 3=W
             
+            # STUCK CENTIPEDE EXCEPTION: If this centipede is stuck, it's always safe to shoot
+            # Stuck centipedes don't move, so they pose no threat after being hit
+            is_stuck = centipede['name'] in self.stuck_centipedes
+            
             for idx, segment in enumerate(body):
                 # Só importa se está na nossa coluna
                 if segment[0] != my_pos.x:
@@ -1177,6 +1199,10 @@ class CentipedeAgent:
                 
                 cobra_na_coluna = True
                 seg_y = segment[1]
+                
+                # STUCK CENTIPEDE EXCEPTION: Always safe to shoot stuck centipedes
+                if is_stuck:
+                    continue
                 
                 # Se está na mesma linha ou abaixo → não atirar
                 if seg_y >= my_pos.y:
