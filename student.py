@@ -322,11 +322,6 @@ class CentipedeAgent:
         self.blaster_position_history.append(my_pos.to_tuple())
         self.blaster_column_history.append(my_pos.x)
         
-        # Don't check too frequently
-        if self.self_stuck_cooldown > 0:
-            self.self_stuck_cooldown -= 1
-            return self.self_stuck_detected
-        
         # Need enough history
         if len(self.blaster_column_history) < 20:
             return False
@@ -336,10 +331,14 @@ class CentipedeAgent:
         if not centipedes:
             return False
         
-        # Pattern 1: Alternating between two columns (adadadadad)
+        # Prepare pattern detection variables
         recent_columns = list(self.blaster_column_history)[-20:]
         unique_columns = set(recent_columns)
         
+        # Check patterns to determine if stuck conditions are present
+        pattern_detected = False
+        
+        # Pattern 1: Alternating between two columns (adadadadad)
         if len(unique_columns) == 2:
             # Check if alternating pattern
             col_a, col_b = sorted(unique_columns)
@@ -350,28 +349,31 @@ class CentipedeAgent:
             
             # If alternating frequently (>12 changes in 20 frames)
             if alternations > 12:
-                if not self.self_stuck_detected:
-                    logger.warning(f"⚠️ SELF-STUCK DETECTED: Alternating between columns {col_a} and {col_b} ({alternations} changes in 20 frames)")
-                self.self_stuck_detected = True
-                self.self_stuck_cooldown = 30  # Check again in 30 frames
-                return True
+                pattern_detected = True
+                # Only activate if not already stuck AND cooldown expired
+                if self.self_stuck_cooldown == 0:
+                    if not self.self_stuck_detected:
+                        logger.warning(f"⚠️ SELF-STUCK DETECTED: Alternating between columns {col_a} and {col_b} ({alternations} changes in 20 frames)")
+                    self.self_stuck_detected = True
+                    self.self_stuck_cooldown = 30  # Check again in 30 frames
         
-        # Pattern 2: All centipedes stuck but blaster not under any
-        # First, check if confined to small column range with stuck centipedes (Pattern 1.5)
-        if len(unique_columns) <= 3:
+        # Pattern 1.5: Confined to small column range with stuck centipedes
+        if not pattern_detected and len(unique_columns) <= 3:
             num_stuck = sum(1 for c in centipedes if c['name'] in self.stuck_centipedes)
             if num_stuck >= len(centipedes) * 0.5:  # At least half are stuck
-                if not self.self_stuck_detected:
-                    col_range = max(unique_columns) - min(unique_columns) if len(unique_columns) > 1 else 0
-                    logger.warning(f"⚠️ SELF-STUCK DETECTED: Confined to {len(unique_columns)} columns (range: {col_range}) with {num_stuck}/{len(centipedes)} stuck centipedes")
-                self.self_stuck_detected = True
-                self.self_stuck_cooldown = 30
-                return True
+                pattern_detected = True
+                # Only activate if not already stuck AND cooldown expired
+                if self.self_stuck_cooldown == 0:
+                    if not self.self_stuck_detected:
+                        col_range = max(unique_columns) - min(unique_columns) if len(unique_columns) > 1 else 0
+                        logger.warning(f"⚠️ SELF-STUCK DETECTED: Confined to {len(unique_columns)} columns (range: {col_range}) with {num_stuck}/{len(centipedes)} stuck centipedes")
+                    self.self_stuck_detected = True
+                    self.self_stuck_cooldown = 30
         
         # Pattern 2: All centipedes stuck but blaster not under any
         all_stuck = len(centipedes) > 0 and all(c['name'] in self.stuck_centipedes for c in centipedes)
         
-        if all_stuck and len(centipedes) >= 2:
+        if not pattern_detected and all_stuck and len(centipedes) >= 2:
             # Check if blaster is aligned with any stuck centipede
             aligned_with_any = False
             for centipede in centipedes:
@@ -400,18 +402,24 @@ class CentipedeAgent:
                 
                 # If far from all stuck centipedes for > 12 frames
                 if frames_far_from_all > 12:
-                    if not self.self_stuck_detected:
-                        logger.warning(f"⚠️ SELF-STUCK DETECTED: All {len(centipedes)} centipedes stuck but blaster not aligned with any for {frames_far_from_all} frames")
-                    self.self_stuck_detected = True
-                    self.self_stuck_cooldown = 30
-                    return True
+                    pattern_detected = True
+                    # Only activate if not already stuck AND cooldown expired
+                    if self.self_stuck_cooldown == 0:
+                        if not self.self_stuck_detected:
+                            logger.warning(f"⚠️ SELF-STUCK DETECTED: All {len(centipedes)} centipedes stuck but blaster not aligned with any for {frames_far_from_all} frames")
+                        self.self_stuck_detected = True
+                        self.self_stuck_cooldown = 30
         
-        # Clear self-stuck if patterns not detected
-        if self.self_stuck_detected:
-            logger.info("✓ Self-stuck condition cleared")
+        # Decrement cooldown (after pattern detection)
+        if self.self_stuck_cooldown > 0:
+            self.self_stuck_cooldown -= 1
+        
+        # Clear self-stuck if NO patterns detected (regardless of cooldown)
+        if not pattern_detected and self.self_stuck_detected:
+            logger.info("✓ Self-stuck condition cleared (patterns no longer present)")
             self.self_stuck_detected = False
         
-        return False
+        return self.self_stuck_detected
     
     def update_danger_zones(self):
         """Create heat map of dangerous positions"""
@@ -2111,6 +2119,13 @@ async def agent_loop(server_address="localhost:8000", agent_name="student"):
                 try:
                     key = agent.decide_action()
                     agent.last_action = key
+                    
+                    # Fix 2: Clear self-stuck immediately when vertical movement is chosen
+                    # Vertical movement breaks the horizontal oscillation cycle
+                    if agent.self_stuck_detected and key in ['w', 's']:
+                        logger.info(f"✓ Self-stuck cleared by vertical movement: {key}")
+                        agent.self_stuck_detected = False
+                        
                 except Exception as action_error:
                     # Log the error but don't crash
                     logger.error(f"Error deciding action: {action_error}", exc_info=True)
