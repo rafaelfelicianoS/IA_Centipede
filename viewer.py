@@ -6,6 +6,7 @@ import os
 import pprint
 
 from consts import Tiles
+from game import Spider
 import pygame
 import websockets
 
@@ -14,7 +15,6 @@ from viewer.common import (
     Directions,
     Food,
     Centipede,
-    Stone,
     ScoreBoard,
     get_direction,
     BugBlaster,
@@ -28,7 +28,7 @@ from viewer.sprites import (
     GameInfoSprite,
     CentipedeSprite,
     FoodSprite,
-    StoneSprite,
+    SpiderSprite,
     ScoreBoardSprite,
 )
 
@@ -79,7 +79,7 @@ async def main(SCALE):
     all_sprites = pygame.sprite.Group()
     centipede_sprites = pygame.sprite.Group()
     food_sprites = pygame.sprite.Group()
-    stone_sprites = pygame.sprite.Group()
+    npc_sprites = pygame.sprite.Group()
     bugblaster_sprites = pygame.sprite.Group()
     prev_mushrooms = None
     centipedes = {}
@@ -130,14 +130,13 @@ async def main(SCALE):
             )
             prev_mushrooms = mushrooms_update
 
-        # Update Stones
-        if new_game:
-            for x, col in enumerate(MAP):
-                for y, pos in enumerate(col):
-                    if pos == Tiles.STONE:
-                        stone_sprites.add(
-                            StoneSprite(Stone(pos=(x, y)), WIDTH, HEIGHT, SCALE)
-                        )
+        # Update NPC
+        if "spider" in state:
+            npc_sprites.empty()
+            spider = Spider(pos=state["spider"]["pos"])
+            npc_sprites.add(SpiderSprite(spider.pos, WIDTH, HEIGHT, SCALE))
+        else:
+            npc_sprites.empty()
 
         # Update centipedes
         if new_game or not all(
@@ -216,11 +215,11 @@ async def main(SCALE):
             all_sprites.update()
             centipede_sprites.update()
             food_sprites.update()
-            stone_sprites.update()
+            npc_sprites.update()
             bugblaster_sprites.update()
         except Exception as e:
             logging.error(e)
-        stone_sprites.draw(display)
+        npc_sprites.draw(display)
         food_sprites.draw(display)
         all_sprites.draw(display)
         centipede_sprites.draw(display)

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import math
 from collections import deque
 from unicodedata import name
 
@@ -12,6 +13,7 @@ from consts import (
     HISTORY_LEN,
     COOL_DOWN,
     KILL_MUSHROOM_POINTS,
+    KILL_SPIDER_POINTS,
     MUSHROOM_SPAWN_RATE,
 )
 from mapa import Map
@@ -25,7 +27,12 @@ MAP_SIZE = (40, 24)
 
 
 class Centipede:
-    def __init__(self, player_name: str, segments: list[tuple[int, int]], dir: Direction = Direction.EAST):
+    def __init__(
+        self,
+        player_name: str,
+        segments: list[tuple[int, int]],
+        dir: Direction = Direction.EAST,
+    ):
         self._name = player_name
         self._body = segments
         logger.info(f"Centipede {self._name} created with body {self._body}")
@@ -212,6 +219,63 @@ class Centipede:
         return None
 
 
+class Spider:
+    def __init__(self, pos):
+        self._pos = pos
+        self._alive = True
+        # _origin_y is the baseline vertical position for the sinusoidal motion
+        self._origin_y = pos[1]
+        self._vx = 1
+        # internal time/phase for the sine function
+        self._t = 0.0
+        self._frequency = random.uniform(0.1, 1.0)
+
+    def move(self, mapa):
+        """
+        Move the spider horizontally across the map, bouncing off left/right edges
+        and following a sinusoidal vertical path.
+
+        """
+
+        # advance phase
+        self._t += +self._frequency
+
+        # desired next x (horizontal movement)
+        new_x = self._pos[0] + self._vx
+
+        # bounce on horizontal edges
+        if new_x < 0:
+            new_x = 0
+            self._vx *= -1
+        elif new_x > mapa.size[0] - 1:
+            new_x = mapa.size[0] - 1
+            self._vx *= -1
+
+        # compute sinusoidal vertical offset around origin
+        sin_offset = math.sin(self._t) * mapa.size[1] // 2
+        new_y = int(round(self._origin_y + sin_offset))
+
+        # clamp vertical within map
+        new_y = max(0, min(mapa.size[1] - 1, new_y))
+
+        self._pos = (new_x, new_y)
+
+    def exists(self):
+        return self._alive
+
+    @property
+    def pos(self):
+        return self._pos
+
+    @property
+    def json(self):
+        return {"pos": self._pos, "alive": self._alive}
+
+    def kill(self):
+        self._alive = False
+        logger.info("Spider <%s> was killed", self.pos)
+
+
 class BugBlaster:
     def __init__(self, pos):
         self._pos = pos
@@ -316,6 +380,7 @@ class Game:
         self._centipedes = []
         self._bug_blaster = None
         self._blasts = []
+        self._spider = Spider(pos=(0, random.randint(0, size[1] // 2)))
         self._last_key = ""
         self._score = 0
         self._cooldown = 0  # frames until next shot
@@ -368,6 +433,24 @@ class Game:
     def keypress(self, player_name, key):
         self._last_key = key
 
+    def update_spider(self):
+        if not self._spider.exists():
+            return  # if spider is dead, we don't need to update it
+
+        self._spider.move(self.map)
+
+        if self._spider.pos == self._bug_blaster.pos:
+            self._bug_blaster.kill()
+            logger.info("BugBlaster was killed by spider at %s", self._spider.pos)
+
+        if self._spider.pos in [m.pos for m in self._mushrooms]:
+            self._mushrooms = [m for m in self._mushrooms if m.pos != self._spider.pos]
+            logger.info("Mushroom at %s was destroyed by spider", self._spider.pos)
+
+        if self._spider.pos == self._bug_blaster.pos:
+            self._bug_blaster.kill()
+            logger.info("BugBlaster was killed by spider at %s", self._spider.pos)
+
     def update_blasts(self):
         self._blasts = [(b_x, b_y - 1) for (b_x, b_y) in self._blasts if b_y - 1 >= 0]
         to_be_removed = []
@@ -382,6 +465,12 @@ class Game:
                         logger.debug("Mushroom %s was destroyed", mushroom)
                         self._score += KILL_MUSHROOM_POINTS
                     break
+
+            if blast == self._spider.pos:
+                to_be_removed.append(blast)
+                self._spider.kill()
+                self._score += KILL_SPIDER_POINTS
+                logger.debug("Spider was hit by a blast", self._spider)
 
         for blast in to_be_removed:
             logger.debug("Blast %s removed after hitting a mushroom", blast)
@@ -437,7 +526,7 @@ class Game:
                         new_centipede = Centipede(
                             centipede.name + "_" + str(random.randint(1, 100)),
                             new_body,
-                            centipede.direction
+                            centipede.direction,
                         )  # TODO proper naming for child centipede
 
                         self._centipedes.append(new_centipede)
@@ -482,6 +571,7 @@ class Game:
             if centipede.alive:
                 centipede.move(self.map, self._mushrooms, self.centipedes)
 
+        self.update_spider()
         self.collision()
         self.update_bug_blaster()
         self.update_blasts()
@@ -500,8 +590,6 @@ class Game:
             if (x, y) != self._bug_blaster.pos:
                 self._mushrooms.append(Mushroom(x=x, y=y))
 
-
-
         self._state = {
             "centipedes": [
                 centipede.json for centipede in self._centipedes if centipede.alive
@@ -513,6 +601,8 @@ class Game:
             "timeout": self._timeout,
             "score": self.score,
         }
+        if self._spider.exists():
+            self._state["spider"] = self._spider.json
 
         if not self.bug_blaster.exists() or all(
             [not centipede.alive for centipede in self._centipedes]
