@@ -199,6 +199,33 @@ class SpiderSprite(pygame.sprite.Sprite):
             (self.SCALE * self.pos[0], self.SCALE * self.pos[1]),
         )
 
+class FleaSprite(pygame.sprite.Sprite):
+    def __init__(self, pos: tuple[int, int], WIDTH, HEIGHT, SCALE):
+        super().__init__()
+
+        FLEA_SPRITESHEET = SpriteSheet("data/centipede-graphics.png")
+
+        self.pos = pos
+        self.SCALE = SCALE
+
+        flea_image_rect = (1 * CELL_SIZE, 2 * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+        self.flea_image = FLEA_SPRITESHEET.image_at(flea_image_rect, -1)
+        self.flea_image = pygame.transform.scale(self.flea_image, (SCALE, SCALE))
+        #self.flea_image.fill("green")
+
+        self.image = pygame.Surface([WIDTH * SCALE, HEIGHT * SCALE])
+        self.rect = self.image.get_rect()
+        self.update()
+
+    def update(self):
+        self.image.fill(BACKGROUND_COLOR)
+        self.image.set_colorkey(BACKGROUND_COLOR)
+
+        # Render Flea
+        self.image.blit(
+            self.flea_image,
+            (self.SCALE * self.pos[0], self.SCALE * self.pos[1]),
+        )
 
 class BlastSprite(pygame.sprite.Sprite):
     def __init__(self, blast: Blast, WIDTH, HEIGHT, SCALE):

@@ -8,6 +8,7 @@ from unicodedata import name
 
 from consts import (
     KILL_CENTIPEDE_BODY_POINTS,
+    KILL_FLEE_POINTS,
     TIMEOUT,
     Direction,
     HISTORY_LEN,
@@ -276,6 +277,34 @@ class Spider:
         logger.info("Spider <%s> was killed", self.pos)
 
 
+class Flee:
+    def __init__(self, pos):
+        self._pos = pos
+        self._alive = True
+
+    def exists(self):
+        return self._alive
+    
+    def move(self, mapa):
+        new_pos = (self._pos[0], self._pos[1] + 1)
+        if new_pos[1] >= mapa.size[1]:
+            self.kill()
+        else:
+            self._pos = new_pos
+
+    @property
+    def pos(self):
+        return self._pos
+
+    @property
+    def json(self):
+        return {"pos": self._pos, "alive": self._alive}
+
+    def kill(self):
+        self._alive = False
+        logger.info("Flee <%s> was killed", self.pos)
+
+
 class BugBlaster:
     def __init__(self, pos):
         self._pos = pos
@@ -381,6 +410,7 @@ class Game:
         self._bug_blaster = None
         self._blasts = []
         self._spider = Spider(pos=(0, random.randint(0, size[1] // 2)))
+        self._flee = None
         self._last_key = ""
         self._score = 0
         self._cooldown = 0  # frames until next shot
@@ -433,6 +463,19 @@ class Game:
     def keypress(self, player_name, key):
         self._last_key = key
 
+
+    def update_flee(self):
+        if self._flee is None or not self._flee.exists():
+            self._flee = None
+            return  # if flee doesn't exist, we don't need to update it
+
+        self._flee.move(self.map)
+
+        if self._flee.pos == self._bug_blaster.pos:
+            self._bug_blaster.kill()
+            logger.info("BugBlaster was killed by flee at %s", self._flee.pos)
+     
+
     def update_spider(self):
         if not self._spider.exists():
             return  # if spider is dead, we don't need to update it
@@ -466,11 +509,17 @@ class Game:
                         self._score += KILL_MUSHROOM_POINTS
                     break
 
-            if blast == self._spider.pos:
+            if self._spider.exists() and blast == self._spider.pos:
                 to_be_removed.append(blast)
                 self._spider.kill()
                 self._score += KILL_SPIDER_POINTS
                 logger.debug("Spider was hit by a blast", self._spider)
+
+            if self._flee and self._flee.exists() and blast == self._flee.pos:
+                to_be_removed.append(blast)
+                self._flee.kill()
+                self._score += KILL_FLEE_POINTS
+                logger.debug("Flee was hit by a blast", self._flee)
 
         for blast in to_be_removed:
             logger.debug("Blast %s removed after hitting a mushroom", blast)
@@ -572,6 +621,7 @@ class Game:
                 centipede.move(self.map, self._mushrooms, self.centipedes)
 
         self.update_spider()
+        self.update_flee()
         self.collision()
         self.update_bug_blaster()
         self.update_blasts()
@@ -584,11 +634,14 @@ class Game:
         ]
 
         # spawn new mushrooms over time
-        if self._step % MUSHROOM_SPAWN_RATE == 0:
+        if self._step % MUSHROOM_SPAWN_RATE == 0 and self._flee is None:
             logger.info("Spawning new mushroom")
             x, y = self.map.spawn_mushroom()
             if (x, y) != self._bug_blaster.pos:
                 self._mushrooms.append(Mushroom(x=x, y=y))
+                # spawn flee
+                self._flee = Flee(pos=(x, y))
+                logger.info("Flee spawned at %s", (x, y))
 
         self._state = {
             "centipedes": [
@@ -603,6 +656,9 @@ class Game:
         }
         if self._spider.exists():
             self._state["spider"] = self._spider.json
+
+        if self._flee and self._flee.exists():
+            self._state["flee"] = self._flee.json
 
         if not self.bug_blaster.exists() or all(
             [not centipede.alive for centipede in self._centipedes]

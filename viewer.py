@@ -6,7 +6,7 @@ import os
 import pprint
 
 from consts import Tiles
-from game import Spider
+from game import Spider, Flee   
 import pygame
 import websockets
 
@@ -24,6 +24,7 @@ from viewer.sprites import (
     BACKGROUND_COLOR,
     BlastSprite,
     BugBlasterSprite,
+    FleaSprite,
     Info,
     GameInfoSprite,
     CentipedeSprite,
@@ -131,12 +132,14 @@ async def main(SCALE):
             prev_mushrooms = mushrooms_update
 
         # Update NPC
+        npc_sprites.empty()
         if "spider" in state:
-            npc_sprites.empty()
             spider = Spider(pos=state["spider"]["pos"])
             npc_sprites.add(SpiderSprite(spider.pos, WIDTH, HEIGHT, SCALE))
-        else:
-            npc_sprites.empty()
+
+        if "flee" in state:
+            flee = Flee(pos=state["flee"]["pos"])
+            npc_sprites.add(FleaSprite(flee.pos, WIDTH, HEIGHT, SCALE))
 
         # Update centipedes
         if new_game or not all(
